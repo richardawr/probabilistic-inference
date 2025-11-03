@@ -469,6 +469,7 @@ class GeometricEngine:
                     # Only use Fibonacci if we have a meaningful swing
                     if abs(major_high - major_low) > current_atr:
                         fib_levels = self.calculate_fibonacci_levels(major_low, major_high)
+                        fib_levels = self.calculate_fibonacci_levels(major_low, major_high)
 
                         # Add Fibonacci levels
                         for name, (level, weight) in fib_levels.items():
@@ -822,7 +823,7 @@ class TradeManager:
                         # Calculate bars to completion
                         entry_time = datetime.fromisoformat(trade['timestamp'])
                         bars_to_completion = max(1,
-                                                 int((current_time - entry_time).total_seconds() / 900))  # 15-min bars
+                                                 int((current_time - entry_time).total_seconds() / 300))  # 5-min bars
 
                         # Record outcome for learning
                         self.learning_manager.record_trade_outcome(trade, outcome, actual_profit, bars_to_completion)
@@ -915,11 +916,17 @@ class EnhancedTradingEngine:
         self.password = "password"
         self.server = "server"
 
-        # Trading limits
-        self.min_confidence = 0.75
-        self.max_confidence = 0.25
+        # Trading limits - ADJUSTED FOR 5M TIMEFRAME
+        self.min_confidence = 0.80  # Increased from 0.75 for 5M
+        self.max_confidence = 0.20  # Decreased from 0.25 for 5M
         self.consecutive_signals = 0
-        self.max_consecutive_signals = 3
+        self.max_consecutive_signals = 2  # Reduced for 5M
+        
+        # NEW: Enhanced signal confirmation for 5M timeframe
+        self.last_trade_time = None
+        self.trade_cooldown = 300  # 5 minutes cooldown (1 bar)
+        self.min_distance_atr = 0.3  # Minimum 0.3 ATR distance from level
+        self.signal_confirmation_required = True
 
     def initialize_mt5(self):
         """Initialize MetaTrader5 connection"""
@@ -949,8 +956,8 @@ class EnhancedTradingEngine:
             logger.error(f"Error during MT5 initialization: {e}")
             return False
 
-    def get_historical_data(self, timeframe=mt5.TIMEFRAME_M15, bars=500):
-        """Get historical data from MT5"""
+    def get_historical_data(self, timeframe=mt5.TIMEFRAME_M5, bars=500):  # CHANGED TO M5
+        """Get historical data from MT5 - NOW USING 5M TIMEFRAME"""
         try:
             mt5.symbol_select(self.symbol, True)
 
@@ -963,7 +970,7 @@ class EnhancedTradingEngine:
             df['time'] = pd.to_datetime(df['time'], unit='s')
             df.set_index('time', inplace=True)
 
-            logger.info(f"Retrieved {len(df)} bars for {self.symbol}")
+            logger.info(f"Retrieved {len(df)} M5 bars for {self.symbol}")
             return df
 
         except Exception as e:
@@ -996,9 +1003,32 @@ class EnhancedTradingEngine:
             logger.error(f"Error calculating position size: {e}")
             return self.lot_size
 
+    def can_open_new_trade(self):
+        """Check if enough time has passed since last trade - NEW METHOD"""
+        if self.last_trade_time is None:
+            return True
+            
+        time_since_last_trade = datetime.now() - self.last_trade_time
+        if time_since_last_trade.total_seconds() < self.trade_cooldown:
+            logger.warning(f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
+            return False
+            
+        # Check if we already have a position in the same symbol
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions:
+            logger.warning(f"Already have {len(positions)} open positions for {self.symbol}")
+            return False
+            
+        return True
+
     def execute_trade(self, signal_type, current_price, stop_distance, reason=""):
         """Execute trade based on signal with proper SL/TP calculation"""
         try:
+            # Add cooldown and position check at the beginning
+            if not self.can_open_new_trade():
+                logger.warning("Trade skipped due to cooldown period or existing position")
+                return False
+                
             if not self.trade_manager.can_trade():
                 logger.warning("Trade not allowed due to risk limits")
                 return False
@@ -1033,8 +1063,8 @@ class EnhancedTradingEngine:
             min_stop_level = getattr(symbol_info, 'trade_stops_level', 10) * symbol_info.point
             calculated_stop = max(current_atr * 1.5, min_stop_level * 2, stop_distance * 2)
 
-            # Ensure stop is at least 10 pips for reasonable trading
-            min_reasonable_stop = 0.0010  # 10 pips for EURUSD
+            # Ensure stop is at least 8 pips for 5M timeframe
+            min_reasonable_stop = 0.0008  # 8 pips for EURUSD on 5M
             final_stop_distance = max(calculated_stop, min_reasonable_stop)
 
             logger.info(
@@ -1079,7 +1109,7 @@ class EnhancedTradingEngine:
                 "tp": tp,
                 "deviation": 20,
                 "magic": 234000,
-                "comment": f"Bayesian-{reason}",
+                "comment": f"Bayesian-5M-{reason}",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -1106,6 +1136,7 @@ class EnhancedTradingEngine:
                     return False
             else:
                 logger.info(f"Trade executed successfully: {signal_type} {self.symbol} {lot_size} lots")
+                self.last_trade_time = datetime.now()  # Update last trade time
 
                 trade_data = self.trade_manager.record_trade(
                     symbol=self.symbol,
@@ -1131,7 +1162,7 @@ class EnhancedTradingEngine:
         self.trade_manager.update_trade_status()
 
     def run_trading_cycle(self):
-        """Main trading cycle"""
+        """Main trading cycle with ENHANCED SIGNAL CONFIRMATION for 5M"""
         try:
             self.trade_manager.update_trade_status()
 
@@ -1167,23 +1198,73 @@ class EnhancedTradingEngine:
 
             logger.info(f"Nearest level: {closest_level:.5f}, Distance: {distance:.5f}, ATR: {atr:.5f}")
 
+            # ENHANCED SIGNAL CONFIRMATION FOR 5M TIMEFRAME
             signal_generated = False
-
+            trade_direction = None
+            
+            # Calculate additional confirmation metrics
+            price_above_level = current_price > closest_level
+            strong_signal = False
+            
+            # Check distance filter first
+            if distance < (atr * self.min_distance_atr):
+                logger.info(f"Signal filtered: distance {distance:.5f} < minimum {atr * self.min_distance_atr:.5f}")
+                self.consecutive_signals = 0
+                return False
+            
             if posterior_revert > self.min_confidence:
-                if current_price > closest_level:
+                # Reversion signal - require stronger confirmation for 5M
+                if posterior_revert > 0.85:  # Higher threshold for reversion on 5M
+                    strong_signal = True
+                    logger.info("STRONG reversion signal detected")
+                if price_above_level:
+                    trade_direction = 'SELL'
                     logger.info(f"SELL signal - Price above level, expecting reversion")
-                    signal_generated = self.execute_trade('SELL', current_price, distance, "Reversion")
                 else:
+                    trade_direction = 'BUY'
                     logger.info(f"BUY signal - Price below level, expecting reversion")
-                    signal_generated = self.execute_trade('BUY', current_price, distance, "Reversion")
 
             elif posterior_revert < self.max_confidence:
-                if current_price > closest_level:
+                # Breakout signal - require stronger confirmation for 5M
+                if posterior_revert < 0.15:  # Lower threshold for breakout on 5M
+                    strong_signal = True
+                    logger.info("STRONG breakout signal detected")
+                if price_above_level:
+                    trade_direction = 'BUY'
                     logger.info(f"BUY signal - Price above level, expecting breakout")
-                    signal_generated = self.execute_trade('BUY', current_price, distance, "Breakout")
                 else:
+                    trade_direction = 'SELL'
                     logger.info(f"SELL signal - Price below level, expecting breakout")
-                    signal_generated = self.execute_trade('SELL', current_price, distance, "Breakout")
+
+            # ENHANCED: Only execute if signal meets confirmation criteria
+            if trade_direction:
+                # Check momentum alignment for 5M
+                rsi = features['rsi']
+                momentum_aligned = False
+                
+                if trade_direction == 'BUY':
+                    momentum_aligned = rsi < 55  # Not overbought for buys on 5M
+                else:  # SELL
+                    momentum_aligned = rsi > 45  # Not oversold for sells on 5M
+                    
+                # Check volume confirmation (if available)
+                volume_confirm = True
+                if 'volume' in df.columns:
+                    current_volume = df['volume'].iloc[-1]
+                    avg_volume = df['volume'].tail(20).mean()
+                    volume_confirm = current_volume > avg_volume * 0.8  # At least 80% of average volume
+                
+                # Execute only if:
+                # 1. Signal is very strong, OR
+                # 2. Signal is moderate AND momentum is aligned AND volume confirms AND we're not in cooldown
+                if strong_signal or (momentum_aligned and volume_confirm and self.can_open_new_trade()):
+                    signal_generated = self.execute_trade(trade_direction, current_price, distance, 
+                                                        "StrongReversion" if strong_signal else "ConfirmedSignal")
+                    if signal_generated:
+                        logger.info(f"Trade executed with enhanced confirmation: {trade_direction}")
+                else:
+                    logger.info(f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
+                    self.consecutive_signals = max(0, self.consecutive_signals - 1)  # Decay consecutive signals
             else:
                 logger.info("No trade signal - confidence threshold not met")
                 self.consecutive_signals = 0
@@ -1205,14 +1286,14 @@ class EnhancedTradingEngine:
 
 def main():
     SYMBOL = "EURUSD"
-    CYCLE_INTERVAL = 60
+    CYCLE_INTERVAL = 60  # Keep 60-second checks for 5M timeframe
 
     trader = EnhancedTradingEngine(SYMBOL, lot_size=0.1)
 
     if not trader.initialize_mt5():
         return
 
-    logger.info(f"Starting Enhanced Bayesian-Geometric Trading Bot for {SYMBOL}")
+    logger.info(f"Starting Enhanced Bayesian-Geometric Trading Bot for {SYMBOL} on 5M timeframe")
 
     # Force initial sync to catch up with existing trades
     trader.force_trade_sync()
