@@ -54,6 +54,7 @@ class LearningDataManager:
                     'win_rates_by_feature_ranges': {},
                     'optimal_thresholds': {},
                     'feature_importance': {},
+                    'summary_stats': {},
                     'last_updated': None
                 }
 
@@ -64,6 +65,7 @@ class LearningDataManager:
                 'win_rates_by_feature_ranges': {},
                 'optimal_thresholds': {},
                 'feature_importance': {},
+                'summary_stats': {},
                 'last_updated': None
             }
 
@@ -214,15 +216,31 @@ class LearningDataManager:
     def update_model_performance(self):
         """Analyze and update model performance metrics"""
         try:
-            if len(self.learning_data['predictions']) < 10:
+            predictions = self.learning_data['predictions']
+            if len(predictions) < 1:
                 return  # Not enough data
 
-            wins = [p for p in self.learning_data['predictions'] if p.get('outcome') == 'WIN']
-            losses = [p for p in self.learning_data['predictions'] if p.get('outcome') == 'LOSS']
+            wins = [p for p in predictions if p.get('outcome') == 'WIN']
+            losses = [p for p in predictions if p.get('outcome') == 'LOSS']
+            breakevens = [p for p in predictions if p.get('outcome') == 'BREAKEVEN']
 
-            total_trades = len(wins) + len(losses)
+            total_trades = len(wins) + len(losses) + len(breakevens)
+
             if total_trades > 0:
                 win_rate = len(wins) / total_trades
+                total_profit = sum(p.get('profit', 0) for p in predictions)
+                avg_profit = total_profit / total_trades if total_trades > 0 else 0
+
+                # Update summary stats
+                self.model_performance['summary_stats'] = {
+                    'total_trades_analyzed': total_trades,
+                    'winning_trades': len(wins),
+                    'losing_trades': len(losses),
+                    'breakeven_trades': len(breakevens),
+                    'overall_win_rate': win_rate,
+                    'total_profit': total_profit,
+                    'average_profit_per_trade': avg_profit
+                }
 
                 # Calculate feature-specific win rates
                 self.analyze_feature_performance()
@@ -231,6 +249,8 @@ class LearningDataManager:
                 self.calculate_optimal_thresholds()
 
                 logger.info(f"Model performance updated: {len(wins)}/{total_trades} wins ({win_rate:.1%})")
+
+            self.save_model_performance()
 
         except Exception as e:
             logger.error(f"Error updating model performance: {e}")
@@ -272,8 +292,6 @@ class LearningDataManager:
     def calculate_optimal_thresholds(self):
         """Calculate optimal confidence thresholds based on historical performance"""
         try:
-            # This would be more sophisticated in a real implementation
-            # For now, we'll just track basic metrics
             predictions_with_posterior = [
                 p for p in self.learning_data['predictions']
                 if p.get('features_at_entry') and 'posterior_probability' in p['features_at_entry']
@@ -309,7 +327,8 @@ class LearningDataManager:
                 'total_trades_recorded': len(self.learning_data['predictions']),
                 'recent_win_rate': 0.0,
                 'feature_performance': self.model_performance.get('win_rates_by_feature_ranges', {}),
-                'optimal_thresholds': self.model_performance.get('optimal_thresholds', {})
+                'optimal_thresholds': self.model_performance.get('optimal_thresholds', {}),
+                'summary_stats': self.model_performance.get('summary_stats', {})
             }
 
             if self.learning_data['predictions']:
@@ -324,9 +343,6 @@ class LearningDataManager:
             logger.error(f"Error getting performance insights: {e}")
             return {}
 
-
-# ... (Keep all other classes the same - GeometricEngine, BayesianEngine, TradeManager, EnhancedTradingEngine)
-# Just replace the LearningDataManager class with this fixed version
 
 class GeometricEngine:
     def __init__(self, atr_period=14):
@@ -655,8 +671,6 @@ class BayesianEngine:
         return self.learning_manager.get_performance_insights()
 
 
-# ... (Keep TradeManager and EnhancedTradingEngine classes the same, but ensure they use float() conversions where needed)
-
 class TradeManager:
     def __init__(self):
         self.trade_history = []
@@ -695,50 +709,132 @@ class TradeManager:
             'sl': float(sl),
             'tp': float(tp),
             'reason': reason,
-            'status': 'OPEN'
+            'status': 'OPEN',
+            'ticket': None,  # Will be populated when we match with MT5
+            'profit': 0.0,
+            'exit_price': 0.0
         }
         self.trade_history.append(trade)
         self.save_trade_history()
         logger.info(f"Recorded trade: {direction} {symbol} {volume} lots")
         return trade
 
-    def update_trade_status(self):
-        """Update status of open trades and record outcomes"""
+    def match_trades_with_positions(self):
+        """Match recorded trades with actual MT5 positions"""
         try:
             positions = mt5.positions_get()
             if positions is None:
-                return
+                positions = []
+
+            # Get closed trades from MT5 history
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
+
+            if deals is None:
+                deals = []
+
+            # Update open trades
+            for trade in self.trade_history:
+                if trade.get('status') == 'OPEN':
+                    # Try to match with open positions
+                    matched_position = None
+                    for pos in positions:
+                        # Match by approximate entry price and direction
+                        price_match = abs(trade['entry_price'] - pos.price_open) < 0.0005
+                        direction_match = (trade['direction'] == 'BUY' and pos.type == 0) or \
+                                          (trade['direction'] == 'SELL' and pos.type == 1)
+
+                        if price_match and direction_match:
+                            matched_position = pos
+                            trade['ticket'] = pos.ticket
+                            break
+
+                    if not matched_position:
+                        # Check if trade was closed (look in deal history)
+                        for deal in deals:
+                            if abs(trade['entry_price'] - deal.price) < 0.0005:
+                                # This might be our trade - mark as closed
+                                trade['status'] = 'CLOSED'
+                                trade['exit_price'] = deal.price
+                                trade['profit'] = deal.profit
+                                trade['exit_time'] = datetime.fromtimestamp(deal.time).isoformat()
+                                logger.info(
+                                    f"Matched closed trade from history: {trade['direction']} {trade['symbol']}")
+                                break
+
+        except Exception as e:
+            logger.error(f"Error matching trades with positions: {e}")
+
+    def update_trade_status(self):
+        """Update status of open trades and record outcomes - FIXED VERSION"""
+        try:
+            self.match_trades_with_positions()
+
+            positions = mt5.positions_get()
+            if positions is None:
+                positions = []
 
             current_time = datetime.now()
+            updated_trades = []
 
-            for trade in self.trade_history[-10:]:
+            for trade in self.trade_history:
                 if trade.get('status') == 'OPEN':
+                    # Check if position still exists
                     position_still_open = any(
-                        abs(trade['entry_price'] - pos.price_open) < 0.00001 and
-                        trade['direction'] == 'BUY' and pos.type == 0 or
-                        trade['direction'] == 'SELL' and pos.type == 1
+                        getattr(pos, 'ticket', None) == trade.get('ticket') or
+                        (abs(trade['entry_price'] - getattr(pos, 'price_open', 0)) < 0.0005 and
+                         ((trade['direction'] == 'BUY' and getattr(pos, 'type', -1) == 0) or
+                          (trade['direction'] == 'SELL' and getattr(pos, 'type', -1) == 1)))
                         for pos in positions
                     )
 
                     if not position_still_open:
-                        # Trade closed, determine outcome
+                        # Trade closed - try to get actual outcome from MT5
                         trade['status'] = 'CLOSED'
                         trade['exit_time'] = current_time.isoformat()
 
-                        # Calculate approximate outcome (in real trading, you'd get this from MT5)
-                        # For now, we'll use a simple approximation
+                        # Get the actual profit from MT5 history
+                        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                        deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
+
+                        actual_profit = 0.0
+                        exit_price = trade['entry_price']  # Default
+
+                        if deals:
+                            for deal in deals:
+                                if abs(trade['entry_price'] - deal.price) < 0.0005:
+                                    actual_profit = deal.profit
+                                    exit_price = deal.price
+                                    trade['ticket'] = deal.ticket
+                                    break
+
+                        trade['profit'] = float(actual_profit)
+                        trade['exit_price'] = float(exit_price)
+
+                        # Determine outcome
+                        if actual_profit > 0:
+                            outcome = 'WIN'
+                        elif actual_profit < 0:
+                            outcome = 'LOSS'
+                        else:
+                            outcome = 'BREAKEVEN'
+
+                        # Calculate bars to completion
                         entry_time = datetime.fromisoformat(trade['timestamp'])
-                        bars_to_completion = int((current_time - entry_time).total_seconds() / 900)  # 15-minute bars
+                        bars_to_completion = max(1,
+                                                 int((current_time - entry_time).total_seconds() / 900))  # 15-min bars
 
-                        # This is a simplified outcome calculation
-                        # In live trading, you'd get actual P/L from MT5
-                        outcome = 'WIN'  # Placeholder - would need actual MT5 position data
-                        profit = 0.0  # Placeholder
+                        # Record outcome for learning
+                        self.learning_manager.record_trade_outcome(trade, outcome, actual_profit, bars_to_completion)
+                        updated_trades.append(trade)
 
-                        self.learning_manager.record_trade_outcome(trade, outcome, profit, bars_to_completion)
-                        logger.info(f"Trade closed: {trade['direction']} {trade['symbol']}")
+                        logger.info(
+                            f"Trade closed: {trade['direction']} {trade['symbol']}, Outcome: {outcome}, Profit: {actual_profit:.2f}")
 
-            self.save_trade_history()
+            if updated_trades:
+                self.save_trade_history()
+                logger.info(f"Updated {len(updated_trades)} trades")
+
         except Exception as e:
             logger.error(f"Error updating trade status: {e}")
 
@@ -756,19 +852,51 @@ class TradeManager:
         return True
 
     def get_performance_stats(self):
-        """Calculate performance statistics"""
+        """Calculate performance statistics - FIXED VERSION"""
         if not self.trade_history:
             return "No trades yet"
 
+        # Use all trades for stats, not just "closed" ones
         closed_trades = [t for t in self.trade_history if t.get('status') == 'CLOSED']
+
         if not closed_trades:
             return "No closed trades yet"
 
-        wins = len([t for t in closed_trades if t.get('outcome') == 'WIN'])
+        wins = len([t for t in closed_trades if t.get('profit', 0) > 0])
+        losses = len([t for t in closed_trades if t.get('profit', 0) < 0])
+        breakevens = len([t for t in closed_trades if t.get('profit', 0) == 0])
         total = len(closed_trades)
-        win_rate = (wins / total) * 100 if total > 0 else 0
 
-        return f"Performance: {wins}/{total} wins ({win_rate:.1f}% win rate)"
+        if total > 0:
+            win_rate = (wins / total) * 100
+            total_profit = sum(t.get('profit', 0) for t in closed_trades)
+        else:
+            win_rate = 0
+            total_profit = 0
+
+        return f"Performance: {wins}/{total} wins ({win_rate:.1f}% win rate), Total PnL: {total_profit:.2f}"
+
+    def sync_with_mt5(self):
+        """Force synchronization with MT5 current state"""
+        try:
+            logger.info("Syncing trade history with MT5...")
+
+            # Get current positions
+            positions = mt5.positions_get()
+            if positions is None:
+                positions = []
+
+            # Get today's deals
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
+
+            logger.info(f"Found {len(positions)} open positions and {len(deals) if deals else 0} today's deals")
+
+            # Update all trades status
+            self.update_trade_status()
+
+        except Exception as e:
+            logger.error(f"Error during MT5 sync: {e}")
 
 
 class EnhancedTradingEngine:
@@ -782,8 +910,8 @@ class EnhancedTradingEngine:
         self.trade_manager = TradeManager()
 
         # MT5 Connection Details
-        self.mt5_path = r"C:\Program Files\mt5_installation\terminal64.exe"
-        self.account = account_number
+        self.mt5_path = r"C:\Program Files\mt5_directory\terminal64.exe"
+        self.account = account
         self.password = "password"
         self.server = "server"
 
@@ -869,7 +997,7 @@ class EnhancedTradingEngine:
             return self.lot_size
 
     def execute_trade(self, signal_type, current_price, stop_distance, reason=""):
-        """Execute trade based on signal"""
+        """Execute trade based on signal with proper SL/TP calculation"""
         try:
             if not self.trade_manager.can_trade():
                 logger.warning("Trade not allowed due to risk limits")
@@ -879,23 +1007,67 @@ class EnhancedTradingEngine:
                 logger.warning(f"Too many consecutive signals ({self.consecutive_signals}), skipping trade")
                 return False
 
-            lot_size = self.calculate_position_size(stop_distance)
-
-            symbol_info = mt5.symbol_info_tick(self.symbol)
+            # Get symbol info for minimum distance requirements
+            symbol_info = mt5.symbol_info(self.symbol)
             if not symbol_info:
+                logger.error(f"Could not get symbol info for {self.symbol}")
+                return False
+
+            # Get current tick data
+            tick_info = mt5.symbol_info_tick(self.symbol)
+            if not tick_info:
                 logger.error(f"Could not get tick data for {self.symbol}")
                 return False
 
+            # Calculate proper stop distance based on ATR and broker requirements
+            df = self.get_historical_data()
+            if df is None:
+                logger.error("Could not get historical data for ATR calculation")
+                return False
+
+            # Calculate ATR for proper stop distance
+            atr = self.geometric_engine.calculate_atr(df['high'], df['low'], df['close'], 14)
+            current_atr = float(atr.iloc[-1])
+
+            # Use minimum of 1.5x ATR or broker's minimum stop level
+            min_stop_level = getattr(symbol_info, 'trade_stops_level', 10) * symbol_info.point
+            calculated_stop = max(current_atr * 1.5, min_stop_level * 2, stop_distance * 2)
+
+            # Ensure stop is at least 10 pips for reasonable trading
+            min_reasonable_stop = 0.0010  # 10 pips for EURUSD
+            final_stop_distance = max(calculated_stop, min_reasonable_stop)
+
+            logger.info(
+                f"Stop calculation: ATR={current_atr:.5f}, MinStop={min_stop_level:.5f}, FinalStop={final_stop_distance:.5f}")
+
+            lot_size = self.calculate_position_size(final_stop_distance)
+
             if signal_type == 'BUY':
                 order_type = mt5.ORDER_TYPE_BUY
-                price = float(symbol_info.ask)
-                sl = float(price - stop_distance)
-                tp = float(price + (2 * stop_distance))
+                price = float(tick_info.ask)
+                sl = float(price - final_stop_distance)
+                tp = float(price + (2 * final_stop_distance))  # 1:2 risk-reward ratio
             else:
                 order_type = mt5.ORDER_TYPE_SELL
-                price = float(symbol_info.bid)
-                sl = float(price + stop_distance)
-                tp = float(price - (2 * stop_distance))
+                price = float(tick_info.bid)
+                sl = float(price + final_stop_distance)
+                tp = float(price - (2 * final_stop_distance))  # 1:2 risk-reward ratio
+
+            # Validate stops against broker requirements
+            if signal_type == 'BUY':
+                if sl >= price - min_stop_level:
+                    sl = price - min_stop_level * 2
+                    logger.warning(f"Adjusted SL to meet broker requirements: {sl:.5f}")
+                if tp <= price + min_stop_level:
+                    tp = price + min_stop_level * 2
+                    logger.warning(f"Adjusted TP to meet broker requirements: {tp:.5f}")
+            else:  # SELL
+                if sl <= price + min_stop_level:
+                    sl = price + min_stop_level * 2
+                    logger.warning(f"Adjusted SL to meet broker requirements: {sl:.5f}")
+                if tp >= price - min_stop_level:
+                    tp = price - min_stop_level * 2
+                    logger.warning(f"Adjusted TP to meet broker requirements: {tp:.5f}")
 
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -912,12 +1084,26 @@ class EnhancedTradingEngine:
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
 
-            logger.info(f"Sending {signal_type} order: Price={price:.5f}, SL={sl:.5f}, TP={tp:.5f}")
+            logger.info(
+                f"Sending {signal_type} order: Price={price:.5f}, SL={sl:.5f}, TP={tp:.5f}, StopDistance={final_stop_distance:.5f}")
 
             result = mt5.order_send(request)
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 logger.error(f"Trade execution failed: {result.retcode} - {result.comment}")
-                return False
+
+                # If stops are invalid, try without stops first
+                if result.retcode == 10016:  # Invalid stops
+                    logger.warning("Invalid stops detected, attempting without SL/TP...")
+                    request.pop('sl', None)
+                    request.pop('tp', None)
+                    result = mt5.order_send(request)
+                    if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logger.info("Trade executed without SL/TP")
+                    else:
+                        logger.error(f"Trade execution failed even without stops: {result.retcode}")
+                        return False
+                else:
+                    return False
             else:
                 logger.info(f"Trade executed successfully: {signal_type} {self.symbol} {lot_size} lots")
 
@@ -937,6 +1123,12 @@ class EnhancedTradingEngine:
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
             return False
+
+    def force_trade_sync(self):
+        """Force synchronization with MT5 trade history"""
+        logger.info("Forcing trade synchronization with MT5...")
+        self.trade_manager.sync_with_mt5()
+        self.trade_manager.update_trade_status()
 
     def run_trading_cycle(self):
         """Main trading cycle"""
@@ -1021,6 +1213,9 @@ def main():
         return
 
     logger.info(f"Starting Enhanced Bayesian-Geometric Trading Bot for {SYMBOL}")
+
+    # Force initial sync to catch up with existing trades
+    trader.force_trade_sync()
 
     try:
         cycle_count = 0
