@@ -782,7 +782,7 @@ class EnhancedTradingEngine:
         self.trade_manager = TradeManager()
 
         # MT5 Connection Details
-        self.mt5_path = r"C:\Program Files\broker\terminal64.exe"
+        self.mt5_path = r"C:\Program Files\mt5_installation\terminal64.exe"
         self.account = account_number
         self.password = "password"
         self.server = "server"
