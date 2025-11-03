@@ -14,6 +14,7 @@ Feature Performance Tracking: Analyzes win rates by RSI ranges and distance cate
 Core Mechanism:
 Trades when posterior probability exceeds adaptive thresholds:
  > 75%: Expect reversion to geometric levels
+
  < 25%: Expect breakout from geometric levels
 
 The system self-optimizes by learning which market conditions (RSI extremes, strong clustering, close proximity to levels) produce the highest win rates.
