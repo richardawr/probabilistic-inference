@@ -1,4 +1,4 @@
-Algorithm Summary
+Algorithm Summary:
 Bayesian Geometric Trading System
 
 Mathematical Foundation:
