@@ -673,13 +673,25 @@ class BayesianEngine:
 
 
 class TradeManager:
-    def __init__(self):
+    def __init__(self, symbol):
+        self.symbol = symbol
         self.trade_history = []
         self.daily_pnl = 0.0
         self.max_daily_loss = -100.0
         self.max_open_trades = 2
         self.learning_manager = LearningDataManager()
+
+        # NEW: Breakeven and trailing stop settings
+        self.breakeven_pips = 10  # Move to breakeven after 10 pips profit
+        self.trailing_start_pips = 15  # Start trailing after 15 pips profit
+        self.trailing_step_pips = 5  # Move stop by 5 pips each step
+        self.breakeven_buffer_pips = 1  # Keep 1 pip buffer when moving to breakeven
+
         self.load_trade_history()
+
+    def set_symbol(self, symbol):
+        """Set the symbol for stop management"""
+        self.symbol = symbol
 
     def load_trade_history(self):
         """Load trade history from file"""
@@ -766,9 +778,129 @@ class TradeManager:
         except Exception as e:
             logger.error(f"Error matching trades with positions: {e}")
 
-    def update_trade_status(self):
-        """Update status of open trades and record outcomes - FIXED VERSION"""
+    def get_pip_size(self):
+        """Get pip size for the symbol"""
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info:
+            return symbol_info.point * 10  # Standard pip size
+        return 0.0001  # Default for EURUSD
+
+    def update_stops_for_open_trades(self):
+        """Update breakeven and trailing stops for open positions"""
         try:
+            positions = mt5.positions_get()
+            if positions is None:
+                return
+
+            for position in positions:
+                # Skip if not our symbol or magic number
+                if position.symbol != self.symbol or position.magic != 234000:
+                    continue
+
+                current_price = position.price_current
+                entry_price = position.price_open
+                current_stop = position.sl
+                direction = position.type  # 0 = BUY, 1 = SELL
+
+                # Calculate profit in pips
+                pip_size = self.get_pip_size()
+                if direction == 0:  # BUY
+                    profit_pips = (current_price - entry_price) / pip_size
+                else:  # SELL
+                    profit_pips = (entry_price - current_price) / pip_size
+
+                # Check if we should move to breakeven
+                if profit_pips >= self.breakeven_pips and current_stop != entry_price:
+                    self.move_to_breakeven(position)
+
+                # Check if we should activate trailing stop
+                elif profit_pips >= self.trailing_start_pips:
+                    self.update_trailing_stop(position, profit_pips, direction)
+
+        except Exception as e:
+            logger.error(f"Error updating stops for open trades: {e}")
+
+    def move_to_breakeven(self, position):
+        """Move stop loss to breakeven plus buffer"""
+        try:
+            pip_size = self.get_pip_size()
+
+            if position.type == 0:  # BUY
+                new_sl = position.price_open - (self.breakeven_buffer_pips * pip_size)
+            else:  # SELL
+                new_sl = position.price_open + (self.breakeven_buffer_pips * pip_size)
+
+            # Only move if new stop is better than current
+            if (position.type == 0 and new_sl > position.sl) or (position.type == 1 and new_sl < position.sl):
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": position.ticket,
+                    "sl": new_sl,
+                    "tp": position.tp,
+                    "deviation": 20,
+                }
+
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(f"Moved to breakeven for ticket {position.ticket}, new SL: {new_sl:.5f}")
+                else:
+                    logger.warning(f"Failed to move to breakeven: {result.retcode}")
+
+        except Exception as e:
+            logger.error(f"Error moving to breakeven: {e}")
+
+    def update_trailing_stop(self, position, profit_pips, direction):
+        """Update trailing stop based on current profit"""
+        try:
+            current_price = position.price_current
+            current_stop = position.sl
+            pip_size = self.get_pip_size()
+
+            if direction == 0:  # BUY
+                # Calculate new stop based on trailing step
+                potential_new_sl = current_price - (self.trailing_step_pips * pip_size)
+                # Only move stop if new stop is higher than current stop
+                if potential_new_sl > current_stop:
+                    request = {
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "position": position.ticket,
+                        "sl": potential_new_sl,
+                        "tp": position.tp,
+                        "deviation": 20,
+                    }
+
+                    result = mt5.order_send(request)
+                    if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logger.info(
+                            f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
+
+            else:  # SELL
+                # Calculate new stop based on trailing step
+                potential_new_sl = current_price + (self.trailing_step_pips * pip_size)
+                # Only move stop if new stop is lower than current stop
+                if potential_new_sl < current_stop or current_stop == 0:
+                    request = {
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "position": position.ticket,
+                        "sl": potential_new_sl,
+                        "tp": position.tp,
+                        "deviation": 20,
+                    }
+
+                    result = mt5.order_send(request)
+                    if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logger.info(
+                            f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
+
+        except Exception as e:
+            logger.error(f"Error updating trailing stop: {e}")
+
+    def update_trade_status(self):
+        """Update status of open trades and record outcomes - UPDATED VERSION"""
+        try:
+            # NEW: Update stops before checking status
+            self.update_stops_for_open_trades()
+
             self.match_trades_with_positions()
 
             positions = mt5.positions_get()
@@ -908,25 +1040,30 @@ class EnhancedTradingEngine:
         self.position = None
         self.geometric_engine = GeometricEngine()
         self.bayesian_engine = BayesianEngine()
-        self.trade_manager = TradeManager()
+        self.trade_manager = TradeManager(symbol)
 
         # MT5 Connection Details
-        self.mt5_path = r"C:\Program Files\mt5_directory\terminal64.exe"
-        self.account = account
-        self.password = "password"
-        self.server = "server"
+        self.mt5_path = r"C:\Program Files\Capital Point Trading MT5 Terminal\terminal64.exe"
+        self.account = 52409363
+        self.password = "11q@9iZM&uUK!G"
+        self.server = "CapitalPointTrading-Demo"
 
         # Trading limits - ADJUSTED FOR 5M TIMEFRAME
         self.min_confidence = 0.80  # Increased from 0.75 for 5M
         self.max_confidence = 0.20  # Decreased from 0.25 for 5M
         self.consecutive_signals = 0
         self.max_consecutive_signals = 2  # Reduced for 5M
-        
+
         # NEW: Enhanced signal confirmation for 5M timeframe
         self.last_trade_time = None
         self.trade_cooldown = 300  # 5 minutes cooldown (1 bar)
         self.min_distance_atr = 0.3  # Minimum 0.3 ATR distance from level
         self.signal_confirmation_required = True
+
+        # NEW: Breakeven and trailing stop configuration
+        self.breakeven_atr_multiplier = 0.8  # Move to breakeven after 0.8 ATR profit
+        self.trailing_start_atr_multiplier = 1.2  # Start trailing after 1.2 ATR profit
+        self.trailing_step_atr_multiplier = 0.3  # Move stop by 0.3 ATR each step
 
     def initialize_mt5(self):
         """Initialize MetaTrader5 connection"""
@@ -1003,22 +1140,38 @@ class EnhancedTradingEngine:
             logger.error(f"Error calculating position size: {e}")
             return self.lot_size
 
+    def calculate_dynamic_stop_settings(self, atr_value):
+        """Calculate dynamic breakeven and trailing settings based on ATR"""
+        pip_size = self.trade_manager.get_pip_size()
+
+        # Convert ATR to pips for settings
+        atr_pips = atr_value / pip_size
+
+        self.trade_manager.breakeven_pips = int(self.breakeven_atr_multiplier * atr_pips)
+        self.trade_manager.trailing_start_pips = int(self.trailing_start_atr_multiplier * atr_pips)
+        self.trade_manager.trailing_step_pips = int(self.trailing_step_atr_multiplier * atr_pips)
+
+        logger.info(f"Dynamic stops: Breakeven at {self.trade_manager.breakeven_pips}pips, "
+                    f"Trailing start at {self.trade_manager.trailing_start_pips}pips, "
+                    f"Step: {self.trade_manager.trailing_step_pips}pips")
+
     def can_open_new_trade(self):
         """Check if enough time has passed since last trade - NEW METHOD"""
         if self.last_trade_time is None:
             return True
-            
+
         time_since_last_trade = datetime.now() - self.last_trade_time
         if time_since_last_trade.total_seconds() < self.trade_cooldown:
-            logger.warning(f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
+            logger.warning(
+                f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
             return False
-            
+
         # Check if we already have a position in the same symbol
         positions = mt5.positions_get(symbol=self.symbol)
         if positions:
             logger.warning(f"Already have {len(positions)} open positions for {self.symbol}")
             return False
-            
+
         return True
 
     def execute_trade(self, signal_type, current_price, stop_distance, reason=""):
@@ -1028,7 +1181,7 @@ class EnhancedTradingEngine:
             if not self.can_open_new_trade():
                 logger.warning("Trade skipped due to cooldown period or existing position")
                 return False
-                
+
             if not self.trade_manager.can_trade():
                 logger.warning("Trade not allowed due to risk limits")
                 return False
@@ -1177,6 +1330,10 @@ class EnhancedTradingEngine:
             self.geometric_engine.update_geometric_levels(df)
             self.bayesian_engine.update_prior_from_trend(df)
 
+            # NEW: Calculate dynamic stop settings based on current ATR
+            atr = float(self.geometric_engine.calculate_atr(df['high'], df['low'], df['close'], 14).iloc[-1])
+            self.calculate_dynamic_stop_settings(atr)
+
             features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
 
             if features is None:
@@ -1201,17 +1358,17 @@ class EnhancedTradingEngine:
             # ENHANCED SIGNAL CONFIRMATION FOR 5M TIMEFRAME
             signal_generated = False
             trade_direction = None
-            
+
             # Calculate additional confirmation metrics
             price_above_level = current_price > closest_level
             strong_signal = False
-            
+
             # Check distance filter first
             if distance < (atr * self.min_distance_atr):
                 logger.info(f"Signal filtered: distance {distance:.5f} < minimum {atr * self.min_distance_atr:.5f}")
                 self.consecutive_signals = 0
                 return False
-            
+
             if posterior_revert > self.min_confidence:
                 # Reversion signal - require stronger confirmation for 5M
                 if posterior_revert > 0.85:  # Higher threshold for reversion on 5M
@@ -1241,29 +1398,30 @@ class EnhancedTradingEngine:
                 # Check momentum alignment for 5M
                 rsi = features['rsi']
                 momentum_aligned = False
-                
+
                 if trade_direction == 'BUY':
                     momentum_aligned = rsi < 55  # Not overbought for buys on 5M
                 else:  # SELL
                     momentum_aligned = rsi > 45  # Not oversold for sells on 5M
-                    
+
                 # Check volume confirmation (if available)
                 volume_confirm = True
                 if 'volume' in df.columns:
                     current_volume = df['volume'].iloc[-1]
                     avg_volume = df['volume'].tail(20).mean()
                     volume_confirm = current_volume > avg_volume * 0.8  # At least 80% of average volume
-                
+
                 # Execute only if:
                 # 1. Signal is very strong, OR
                 # 2. Signal is moderate AND momentum is aligned AND volume confirms AND we're not in cooldown
                 if strong_signal or (momentum_aligned and volume_confirm and self.can_open_new_trade()):
-                    signal_generated = self.execute_trade(trade_direction, current_price, distance, 
-                                                        "StrongReversion" if strong_signal else "ConfirmedSignal")
+                    signal_generated = self.execute_trade(trade_direction, current_price, distance,
+                                                          "StrongReversion" if strong_signal else "ConfirmedSignal")
                     if signal_generated:
                         logger.info(f"Trade executed with enhanced confirmation: {trade_direction}")
                 else:
-                    logger.info(f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
+                    logger.info(
+                        f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
                     self.consecutive_signals = max(0, self.consecutive_signals - 1)  # Decay consecutive signals
             else:
                 logger.info("No trade signal - confidence threshold not met")
