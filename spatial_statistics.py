@@ -34,6 +34,14 @@ class LearningDataManager:
             'model_metrics': [],
             'last_updated': None
         }
+        self.model_performance = {
+            'win_rates_by_feature_ranges': {},
+            'optimal_thresholds': {},
+            'feature_importance': {},
+            'summary_stats': {},
+            'last_updated': None
+        }
+        self._last_backup_win_rate = 0.0
         self.load_learning_data()
 
     def load_learning_data(self):
@@ -49,14 +57,10 @@ class LearningDataManager:
                 with open(self.model_performance_file, 'r') as f:
                     self.model_performance = json.load(f)
                 logger.info(f"Loaded model performance data")
-            else:
-                self.model_performance = {
-                    'win_rates_by_feature_ranges': {},
-                    'optimal_thresholds': {},
-                    'feature_importance': {},
-                    'summary_stats': {},
-                    'last_updated': None
-                }
+
+            # Initialize last backup win rate
+            if self.model_performance.get('summary_stats'):
+                self._last_backup_win_rate = self.model_performance['summary_stats'].get('overall_win_rate', 0.0)
 
         except Exception as e:
             logger.error(f"Error loading learning data: {e}")
@@ -70,7 +74,7 @@ class LearningDataManager:
             }
 
     def save_learning_data(self):
-        """Save learning data to file - FIXED JSON SERIALIZATION"""
+        """Save learning data to file - WITH SMART BACKUP MANAGEMENT"""
         try:
             self.learning_data['last_updated'] = datetime.now().isoformat()
 
@@ -80,13 +84,85 @@ class LearningDataManager:
             with open(self.learning_file, 'w') as f:
                 json.dump(serializable_data, f, indent=2, default=str)
 
-            # Also save to a backup with timestamp
-            backup_file = f"learning_data_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(backup_file, 'w') as f:
-                json.dump(serializable_data, f, indent=2, default=str)
+            # SMART BACKUP: Create backup only once per day or when significant learning occurs
+            self._create_smart_backup(serializable_data)
 
         except Exception as e:
             logger.error(f"Error saving learning data: {e}")
+
+    def _create_smart_backup(self, data):
+        """Create backups intelligently based on conditions"""
+        try:
+            backup_dir = "learning_backups"
+            os.makedirs(backup_dir, exist_ok=True)
+
+            # Condition 1: Daily backup (once per day)
+            daily_backup_file = os.path.join(backup_dir,
+                                             f"learning_data_daily_{datetime.now().strftime('%Y%m%d')}.json")
+            if not os.path.exists(daily_backup_file):
+                with open(daily_backup_file, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                logger.info(f"Created daily backup: {daily_backup_file}")
+
+            # Condition 2: Milestone backup (every 100 new learning points)
+            recent_points = len([p for p in data['features']
+                                 if datetime.fromisoformat(p['timestamp']).date() == datetime.now().date()])
+
+            if recent_points % 100 == 0 and recent_points > 0:
+                milestone_file = os.path.join(backup_dir,
+                                              f"learning_milestone_{recent_points}points_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+                with open(milestone_file, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                logger.info(f"Created milestone backup: {milestone_file}")
+
+            # Condition 3: Performance improvement backup
+            if self._should_backup_for_performance():
+                perf_backup_file = os.path.join(backup_dir,
+                                                f"learning_perf_improvement_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+                with open(perf_backup_file, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                logger.info(f"Created performance backup: {perf_backup_file}")
+
+            # Clean up old backups (keep last 30 days)
+            self._cleanup_old_backups(backup_dir)
+
+        except Exception as e:
+            logger.error(f"Error creating smart backup: {e}")
+
+    def _should_backup_for_performance(self):
+        """Check if we should backup due to significant performance improvement"""
+        try:
+            if not self.model_performance.get('summary_stats'):
+                return False
+
+            current_win_rate = self.model_performance['summary_stats'].get('overall_win_rate', 0)
+
+            # Check if win rate improved significantly (5% improvement)
+            improvement = current_win_rate - self._last_backup_win_rate
+            if improvement >= 0.05:  # 5% improvement
+                self._last_backup_win_rate = current_win_rate
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    def _cleanup_old_backups(self, backup_dir, keep_days=30):
+        """Remove backups older than keep_days days"""
+        try:
+            cutoff_time = datetime.now() - timedelta(days=keep_days)
+
+            for filename in os.listdir(backup_dir):
+                if filename.startswith("learning_") and filename.endswith(".json"):
+                    filepath = os.path.join(backup_dir, filename)
+                    file_time = datetime.fromtimestamp(os.path.getctime(filepath))
+
+                    if file_time < cutoff_time:
+                        os.remove(filepath)
+                        logger.info(f"Removed old backup: {filename}")
+
+        except Exception as e:
+            logger.error(f"Error cleaning up old backups: {e}")
 
     def _make_serializable(self, obj):
         """Convert non-serializable objects to serializable types"""
@@ -342,6 +418,44 @@ class LearningDataManager:
         except Exception as e:
             logger.error(f"Error getting performance insights: {e}")
             return {}
+
+    def get_system_status(self):
+        """Get system status for display"""
+        try:
+            stats = self.model_performance.get('summary_stats', {})
+
+            status = {
+                'trades_analyzed': stats.get('total_trades_analyzed', 0),
+                'win_rate': stats.get('overall_win_rate', 0.0),
+                'learning_points': len(self.learning_data['features']),
+                'last_updated': self.learning_data.get('last_updated', 'Never'),
+                'winning_trades': stats.get('winning_trades', 0),
+                'losing_trades': stats.get('losing_trades', 0),
+                'total_profit': stats.get('total_profit', 0.0),
+                'recent_win_rate': 0.0
+            }
+
+            # Calculate recent win rate (last 20 trades)
+            if self.learning_data['predictions']:
+                recent_trades = self.learning_data['predictions'][-20:]
+                wins = len([t for t in recent_trades if t.get('outcome') == 'WIN'])
+                if recent_trades:
+                    status['recent_win_rate'] = wins / len(recent_trades)
+
+            return status
+
+        except Exception as e:
+            logger.error(f"Error getting system status: {e}")
+            return {
+                'trades_analyzed': 0,
+                'win_rate': 0.0,
+                'learning_points': 0,
+                'last_updated': 'Error',
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'total_profit': 0.0,
+                'recent_win_rate': 0.0
+            }
 
 
 class GeometricEngine:
@@ -680,13 +794,13 @@ class TradeManager:
         self.max_daily_loss = -100.0
         self.max_open_trades = 2
         self.learning_manager = LearningDataManager()
-        
+
         # Breakeven and trailing stop settings
         self.breakeven_pips = 10
         self.trailing_start_pips = 15
         self.trailing_step_pips = 5
         self.breakeven_buffer_pips = 1
-        
+
         self.load_trade_history()
 
     def set_symbol(self, symbol):
@@ -751,7 +865,7 @@ class TradeManager:
             for trade in self.trade_history:
                 if trade.get('status') == 'OPEN':
                     matched = False
-                    
+
                     # Try to match by ticket first
                     if trade.get('ticket'):
                         for pos in positions:
@@ -759,13 +873,13 @@ class TradeManager:
                                 trade['ticket'] = pos.ticket
                                 matched = True
                                 break
-                    
+
                     # If no ticket match, try by approximate price and time
                     if not matched:
                         for pos in positions:
                             price_match = abs(trade['entry_price'] - pos.price_open) < 0.0010  # Wider tolerance
                             time_match = True  # Assume match if price is close
-                            
+
                             if price_match and time_match:
                                 trade['ticket'] = pos.ticket
                                 matched = True
@@ -777,25 +891,25 @@ class TradeManager:
                 if trade.get('status') == 'OPEN' and trade.get('ticket'):
                     # Check if position still exists
                     position_still_open = any(pos.ticket == trade['ticket'] for pos in positions)
-                    
+
                     if not position_still_open:
                         # Trade was closed - find in deal history
                         trade_profit = 0.0
                         exit_price = trade['entry_price']
-                        
+
                         for deal in deals:
-                            if (deal.position_id == trade['ticket'] or 
-                                abs(trade['entry_price'] - deal.price) < 0.0010):
+                            if (deal.position_id == trade['ticket'] or
+                                    abs(trade['entry_price'] - deal.price) < 0.0010):
                                 trade_profit += deal.profit
                                 exit_price = deal.price
                                 logger.info(f"Found closing deal for ticket {trade['ticket']}")
-                        
+
                         if trade_profit != 0:  # Only mark closed if we found deals
                             trade['status'] = 'CLOSED'
                             trade['exit_price'] = float(exit_price)
                             trade['profit'] = float(trade_profit)
                             trade['exit_time'] = datetime.now().isoformat()
-                            
+
                             # Determine outcome
                             if trade_profit > 0:
                                 outcome = 'WIN'
@@ -803,19 +917,19 @@ class TradeManager:
                                 outcome = 'LOSS'
                             else:
                                 outcome = 'BREAKEVEN'
-                                
+
                             # Calculate bars to completion
                             entry_time = datetime.fromisoformat(trade['timestamp'])
                             exit_time = datetime.now()
                             bars_to_completion = max(1, int((exit_time - entry_time).total_seconds() / 300))
-                            
+
                             # Record outcome for learning
                             self.learning_manager.record_trade_outcome(
                                 trade, outcome, trade_profit, bars_to_completion
                             )
-                            
+
                             logger.info(f"Trade closed: {trade['direction']} {self.symbol}, "
-                                      f"Outcome: {outcome}, Profit: {trade_profit:.2f}")
+                                        f"Outcome: {outcome}, Profit: {trade_profit:.2f}")
 
             self.save_trade_history()
 
@@ -856,7 +970,7 @@ class TradeManager:
                 entry_price = position.price_open
                 current_stop = position.sl
                 direction = position.type  # 0 = BUY, 1 = SELL
-                
+
                 # Calculate profit in pips
                 pip_size = self.get_pip_size()
                 if direction == 0:  # BUY
@@ -867,7 +981,7 @@ class TradeManager:
                 # Check if we should move to breakeven
                 if profit_pips >= self.breakeven_pips and current_stop != entry_price:
                     self.move_to_breakeven(position)
-                
+
                 # Check if we should activate trailing stop
                 elif profit_pips >= self.trailing_start_pips:
                     self.update_trailing_stop(position, profit_pips, direction)
@@ -879,7 +993,7 @@ class TradeManager:
         """Move stop loss to breakeven plus buffer"""
         try:
             pip_size = self.get_pip_size()
-            
+
             if position.type == 0:  # BUY
                 new_sl = position.price_open - (self.breakeven_buffer_pips * pip_size)
             else:  # SELL
@@ -894,13 +1008,13 @@ class TradeManager:
                     "tp": position.tp,
                     "deviation": 20,
                 }
-                
+
                 result = mt5.order_send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     logger.info(f"Moved to breakeven for ticket {position.ticket}, new SL: {new_sl:.5f}")
                 else:
                     logger.warning(f"Failed to move to breakeven: {result.retcode}")
-                    
+
         except Exception as e:
             logger.error(f"Error moving to breakeven: {e}")
 
@@ -910,7 +1024,7 @@ class TradeManager:
             current_price = position.price_current
             current_stop = position.sl
             pip_size = self.get_pip_size()
-            
+
             if direction == 0:  # BUY
                 # Calculate new stop based on trailing step
                 potential_new_sl = current_price - (self.trailing_step_pips * pip_size)
@@ -923,11 +1037,12 @@ class TradeManager:
                         "tp": position.tp,
                         "deviation": 20,
                     }
-                    
+
                     result = mt5.order_send(request)
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
-                        logger.info(f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
-            
+                        logger.info(
+                            f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
+
             else:  # SELL
                 # Calculate new stop based on trailing step
                 potential_new_sl = current_price + (self.trailing_step_pips * pip_size)
@@ -940,11 +1055,12 @@ class TradeManager:
                         "tp": position.tp,
                         "deviation": 20,
                     }
-                    
+
                     result = mt5.order_send(request)
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
-                        logger.info(f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
-                        
+                        logger.info(
+                            f"Trailing stop updated for ticket {position.ticket}, new SL: {potential_new_sl:.5f}")
+
         except Exception as e:
             logger.error(f"Error updating trailing stop: {e}")
 
@@ -953,7 +1069,7 @@ class TradeManager:
         try:
             # NEW: Update stops before checking status
             self.update_stops_for_open_trades()
-            
+
             self.match_trades_with_positions()
 
         except Exception as e:
@@ -976,27 +1092,27 @@ class TradeManager:
         """IMPROVED: Better synchronization with MT5"""
         try:
             logger.info("Starting MT5 synchronization...")
-            
+
             # Get current positions
             positions = mt5.positions_get(symbol=self.symbol)
             if positions is None:
                 positions = []
-                
+
             # Get account info for balance
             account_info = mt5.account_info()
             balance = account_info.balance if account_info else 0
-            
+
             # Get today's deals
             today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
             if deals is None:
                 deals = []
-                
+
             logger.info(f"Sync found: {len(positions)} positions, {len(deals)} deals, Balance: {balance}")
-            
+
             # Rebuild trade history from MT5 data for accuracy
             self.rebuild_trade_history_from_mt5(positions, deals)
-            
+
         except Exception as e:
             logger.error(f"Error during MT5 sync: {e}")
 
@@ -1005,7 +1121,7 @@ class TradeManager:
         try:
             # Clear existing history and rebuild from MT5
             new_trade_history = []
-            
+
             # Process open positions
             for pos in positions:
                 if pos.symbol == self.symbol and pos.magic == 234000:
@@ -1025,7 +1141,7 @@ class TradeManager:
                     }
                     new_trade_history.append(trade)
                     logger.info(f"Added open position: {trade['direction']} {pos.ticket}")
-            
+
             # Process closed deals (group by position)
             closed_positions = {}
             for deal in deals:
@@ -1044,7 +1160,7 @@ class TradeManager:
                         closed_positions[deal.position_id]['profit'] += deal.profit
                         closed_positions[deal.position_id]['exit_time'] = datetime.fromtimestamp(deal.time)
                         closed_positions[deal.position_id]['exit_price'] = deal.price
-            
+
             # Add closed trades to history
             for pos_id, trade_data in closed_positions.items():
                 if trade_data['exit_time']:  # Only add completed trades
@@ -1065,13 +1181,13 @@ class TradeManager:
                     }
                     new_trade_history.append(trade)
                     logger.info(f"Added closed trade: {trade['direction']} {pos_id}, Profit: {trade['profit']:.2f}")
-            
+
             # Replace old history with rebuilt one
             self.trade_history = new_trade_history
             self.save_trade_history()
-            
+
             logger.info(f"Rebuilt trade history: {len(self.trade_history)} total trades")
-            
+
         except Exception as e:
             logger.error(f"Error rebuilding trade history: {e}")
 
@@ -1080,34 +1196,34 @@ class TradeManager:
         try:
             if not self.trade_history:
                 return "No trades recorded"
-            
+
             closed_trades = [t for t in self.trade_history if t.get('status') == 'CLOSED']
             open_trades = [t for t in self.trade_history if t.get('status') == 'OPEN']
-            
+
             if not closed_trades:
                 return f"No closed trades yet. {len(open_trades)} open positions."
-            
+
             wins = len([t for t in closed_trades if t.get('profit', 0) > 0])
             losses = len([t for t in closed_trades if t.get('profit', 0) < 0])
             breakevens = len([t for t in closed_trades if t.get('profit', 0) == 0])
             total_closed = len(closed_trades)
-            
+
             if total_closed > 0:
                 win_rate = (wins / total_closed) * 100
                 total_profit = sum(t.get('profit', 0) for t in closed_trades)
                 avg_profit = total_profit / total_closed
-                
+
                 # Calculate current open positions profit
                 current_open_profit = sum(t.get('profit', 0) for t in open_trades)
-                
+
                 stats = (f"Performance: {wins}/{total_closed} wins ({win_rate:.1f}% win rate)\n"
-                        f"Total PnL: {total_profit:.2f} | Avg Trade: {avg_profit:.2f}\n"
-                        f"Open Positions: {len(open_trades)} | Current PnL: {current_open_profit:.2f}")
+                         f"Total PnL: {total_profit:.2f} | Avg Trade: {avg_profit:.2f}\n"
+                         f"Open Positions: {len(open_trades)} | Current PnL: {current_open_profit:.2f}")
             else:
                 stats = "No completed trades yet"
-                
+
             return stats
-            
+
         except Exception as e:
             logger.error(f"Error calculating performance stats: {e}")
             return "Error calculating statistics"
@@ -1134,17 +1250,17 @@ class EnhancedTradingEngine:
         self.max_confidence = 0.20  # Decreased from 0.25 for 5M
         self.consecutive_signals = 0
         self.max_consecutive_signals = 2  # Reduced for 5M
-        
+
         # Enhanced signal confirmation for 5M timeframe
         self.last_trade_time = None
         self.trade_cooldown = 300  # 5 minutes cooldown (1 bar)
         self.min_distance_atr = 0.3  # Minimum 0.3 ATR distance from level
         self.signal_confirmation_required = True
-        
+
         # Breakeven and trailing stop configuration
         self.breakeven_atr_multiplier = 0.8  # Move to breakeven after 0.8 ATR profit
         self.trailing_start_atr_multiplier = 1.2  # Start trailing after 1.2 ATR profit
-        self.trailing_step_atr_multiplier = 0.3   # Move stop by 0.3 ATR each step
+        self.trailing_step_atr_multiplier = 0.3  # Move stop by 0.3 ATR each step
 
     def initialize_mt5(self):
         """Initialize MetaTrader5 connection"""
@@ -1224,37 +1340,39 @@ class EnhancedTradingEngine:
     def calculate_dynamic_stop_settings(self, atr_value):
         """Calculate dynamic breakeven and trailing settings based on ATR"""
         pip_size = self.trade_manager.get_pip_size()
-        
-        # Convert ATR to pips for settings
+
+        # Convert ATR to pips for settings - FIXED CALCULATION
         atr_pips = atr_value / pip_size
-        
-        self.trade_manager.breakeven_pips = int(self.breakeven_atr_multiplier * atr_pips)
-        self.trade_manager.trailing_start_pips = int(self.trailing_start_atr_multiplier * atr_pips)
-        self.trade_manager.trailing_step_pips = int(self.trailing_step_atr_multiplier * atr_pips)
-        
-        logger.info(f"Dynamic stops: Breakeven at {self.trade_manager.breakeven_pips}pips, "
-                   f"Trailing start at {self.trade_manager.trailing_start_pips}pips, "
-                   f"Step: {self.trade_manager.trailing_step_pips}pips")
+
+        # Ensure minimum values to avoid zero pips
+        self.trade_manager.breakeven_pips = max(1, int(self.breakeven_atr_multiplier * atr_pips))
+        self.trade_manager.trailing_start_pips = max(2, int(self.trailing_start_atr_multiplier * atr_pips))
+        self.trade_manager.trailing_step_pips = max(1, int(self.trailing_step_atr_multiplier * atr_pips))
+
+        logger.info(f"Dynamic stops: Breakeven at {self.trade_manager.breakeven_pips} pips, "
+                    f"Trailing start at {self.trade_manager.trailing_start_pips} pips, "
+                    f"Step: {self.trade_manager.trailing_step_pips} pips")
 
     def can_open_new_trade(self):
         """ACCURATE: Check if we can open new trade"""
         try:
             if self.last_trade_time is None:
                 return True
-                
+
             time_since_last_trade = datetime.now() - self.last_trade_time
             if time_since_last_trade.total_seconds() < self.trade_cooldown:
-                logger.warning(f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
+                logger.warning(
+                    f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
                 return False
-                
+
             # Use accurate position counting
             current_positions = self.trade_manager.get_current_open_positions_count()
             if current_positions >= self.trade_manager.max_open_trades:
                 logger.warning(f"Already have {current_positions} open positions for {self.symbol}")
                 return False
-                
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error checking if can open new trade: {e}")
             return False
@@ -1266,7 +1384,7 @@ class EnhancedTradingEngine:
             if not self.can_open_new_trade():
                 logger.warning("Trade skipped due to cooldown period or existing position")
                 return False
-                
+
             if not self.trade_manager.can_trade():
                 logger.warning("Trade not allowed due to risk limits")
                 return False
@@ -1399,12 +1517,61 @@ class EnhancedTradingEngine:
         self.trade_manager.sync_with_mt5()
         self.trade_manager.match_trades_with_positions()
 
+    def display_system_status(self):
+        """Display comprehensive system status in console"""
+        try:
+            status = self.bayesian_engine.learning_manager.get_system_status()
+
+            print("\n" + "=" * 50)
+            print("       TRADING SYSTEM STATUS")
+            print("=" * 50)
+            print(f"   Trades Analyzed: {status['trades_analyzed']}")
+            print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
+            print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
+            print(f"   Learning Points: {status['learning_points']}")
+            print(f"   Total Profit: ${status['total_profit']:.2f}")
+
+            # Format last updated time nicely
+            last_updated = status['last_updated']
+            if last_updated != 'Never' and last_updated != 'Error':
+                try:
+                    last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                    time_diff = datetime.now().astimezone() - last_time
+                    hours_ago = time_diff.total_seconds() / 3600
+                    last_updated_str = f"{last_time.strftime('%Y-%m-%d %H:%M:%S')} ({hours_ago:.1f}h ago)"
+                except:
+                    last_updated_str = last_updated
+            else:
+                last_updated_str = last_updated
+
+            print(f"   Last Updated: {last_updated_str}")
+
+            # Current market status
+            df = self.get_historical_data()
+            if df is not None and len(df) > 0:
+                current_price = float(df['close'].iloc[-1])
+                features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
+                if features is not None:
+                    posterior = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
+                    print(f"   Current P(Reversion): {posterior:.3f}")
+                    print(f"   Current RSI: {features['rsi']:.1f}")
+
+            # Open positions
+            open_positions = self.trade_manager.get_current_open_positions_count()
+            print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
+
+            print("=" * 50)
+
+        except Exception as e:
+            logger.error(f"Error displaying system status: {e}")
+            print("\n   Error displaying system status")
+
     def run_trading_cycle(self):
         """IMPROVED: Trading cycle with better statistics"""
         try:
             # Update trade status with improved matching
             self.trade_manager.update_trade_status()
-            
+
             df = self.get_historical_data()
             if df is None or len(df) == 0:
                 logger.error("No data retrieved")
@@ -1419,7 +1586,7 @@ class EnhancedTradingEngine:
             # Calculate dynamic stop settings based on current ATR
             atr = float(self.geometric_engine.calculate_atr(df['high'], df['low'], df['close'], 14).iloc[-1])
             self.calculate_dynamic_stop_settings(atr)
-            
+
             features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
 
             if features is None:
@@ -1428,7 +1595,8 @@ class EnhancedTradingEngine:
 
             posterior_revert = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
 
-            logger.info(f"P(Reversion): {posterior_revert:.3f}, Features - d: {features['d']:.3f}, c: {features['c']:.3f}, RSI: {features['rsi']:.1f}")
+            logger.info(
+                f"P(Reversion): {posterior_revert:.3f}, Features - d: {features['d']:.3f}, c: {features['c']:.3f}, RSI: {features['rsi']:.1f}")
 
             nearest_levels = self.geometric_engine.get_nearest_levels(current_price, 1)
             if not nearest_levels:
@@ -1441,17 +1609,17 @@ class EnhancedTradingEngine:
             # ENHANCED SIGNAL CONFIRMATION FOR 5M TIMEFRAME
             signal_generated = False
             trade_direction = None
-            
+
             # Calculate additional confirmation metrics
             price_above_level = current_price > closest_level
             strong_signal = False
-            
+
             # Check distance filter first
             if distance < (atr * self.min_distance_atr):
                 logger.info(f"Signal filtered: distance {distance:.5f} < minimum {atr * self.min_distance_atr:.5f}")
                 self.consecutive_signals = 0
                 return False
-            
+
             if posterior_revert > self.min_confidence:
                 # Reversion signal - require stronger confirmation for 5M
                 if posterior_revert > 0.85:  # Higher threshold for reversion on 5M
@@ -1481,29 +1649,30 @@ class EnhancedTradingEngine:
                 # Check momentum alignment for 5M
                 rsi = features['rsi']
                 momentum_aligned = False
-                
+
                 if trade_direction == 'BUY':
                     momentum_aligned = rsi < 55  # Not overbought for buys on 5M
                 else:  # SELL
                     momentum_aligned = rsi > 45  # Not oversold for sells on 5M
-                    
+
                 # Check volume confirmation (if available)
                 volume_confirm = True
                 if 'volume' in df.columns:
                     current_volume = df['volume'].iloc[-1]
                     avg_volume = df['volume'].tail(20).mean()
                     volume_confirm = current_volume > avg_volume * 0.8  # At least 80% of average volume
-                
+
                 # Execute only if:
                 # 1. Signal is very strong, OR
                 # 2. Signal is moderate AND momentum is aligned AND volume confirms AND we're not in cooldown
                 if strong_signal or (momentum_aligned and volume_confirm and self.can_open_new_trade()):
-                    signal_generated = self.execute_trade(trade_direction, current_price, distance, 
-                                                        "StrongReversion" if strong_signal else "ConfirmedSignal")
+                    signal_generated = self.execute_trade(trade_direction, current_price, distance,
+                                                          "StrongReversion" if strong_signal else "ConfirmedSignal")
                     if signal_generated:
                         logger.info(f"Trade executed with enhanced confirmation: {trade_direction}")
                 else:
-                    logger.info(f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
+                    logger.info(
+                        f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
                     self.consecutive_signals = max(0, self.consecutive_signals - 1)  # Decay consecutive signals
             else:
                 logger.info("No trade signal - confidence threshold not met")
@@ -1528,6 +1697,7 @@ class EnhancedTradingEngine:
 def main():
     SYMBOL = "EURUSD"
     CYCLE_INTERVAL = 60  # Keep 60-second checks for 5M timeframe
+    STATUS_DISPLAY_INTERVAL = 3  # Reduced to 3 cycles for faster status display
 
     trader = EnhancedTradingEngine(SYMBOL, lot_size=0.1)
 
@@ -1539,6 +1709,9 @@ def main():
     # Force initial sync to catch up with existing trades
     trader.force_trade_sync()
 
+    # Display initial status immediately
+    trader.display_system_status()
+
     try:
         cycle_count = 0
         while True:
@@ -1546,6 +1719,10 @@ def main():
             logger.info(f"--- Trading Cycle {cycle_count} ---")
 
             trader.run_trading_cycle()
+
+            # Display system status every STATUS_DISPLAY_INTERVAL cycles
+            if cycle_count % STATUS_DISPLAY_INTERVAL == 0:
+                trader.display_system_status()
 
             logger.info(f"Waiting {CYCLE_INTERVAL} seconds until next cycle...")
             time.sleep(CYCLE_INTERVAL)
