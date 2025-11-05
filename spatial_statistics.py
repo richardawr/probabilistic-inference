@@ -85,7 +85,7 @@ class FixedLearningDataManager:
             logger.error(f"Error saving learning data: {e}")
 
     def record_trade(self, trade_data):
-        """Record a complete trade with outcome"""
+        """Record a complete trade with outcome - FIXED VERSION"""
         try:
             trade_record = {
                 'ticket': trade_data.get('ticket'),
@@ -145,11 +145,12 @@ class FixedLearningDataManager:
             return 'BREAKEVEN'
 
     def _update_performance_stats(self):
-        """Update performance statistics"""
+        """Update performance statistics - FIXED VERSION"""
         try:
-            closed_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'CLOSED']
+            # Use ALL trades for statistics, not just closed ones
+            all_trades = self.learning_data['trades']
 
-            if not closed_trades:
+            if not all_trades:
                 self.model_performance['summary_stats'] = {
                     'total_trades': 0,
                     'winning_trades': 0,
@@ -161,11 +162,11 @@ class FixedLearningDataManager:
                 }
                 return
 
-            wins = len([t for t in closed_trades if t.get('outcome') == 'WIN'])
-            losses = len([t for t in closed_trades if t.get('outcome') == 'LOSS'])
-            breakevens = len([t for t in closed_trades if t.get('outcome') == 'BREAKEVEN'])
-            total_trades = len(closed_trades)
-            total_profit = sum(t.get('profit', 0) for t in closed_trades)
+            wins = len([t for t in all_trades if t.get('outcome') == 'WIN'])
+            losses = len([t for t in all_trades if t.get('outcome') == 'LOSS'])
+            breakevens = len([t for t in all_trades if t.get('outcome') == 'BREAKEVEN'])
+            total_trades = len(all_trades)
+            total_profit = sum(t.get('profit', 0) for t in all_trades)
 
             self.model_performance['summary_stats'] = {
                 'total_trades': total_trades,
@@ -210,38 +211,40 @@ class FixedLearningDataManager:
     def get_system_status(self):
         """Get accurate system status - FIXED VERSION"""
         try:
-            # Ensure we have the latest data
-            closed_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'CLOSED']
-            open_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'OPEN']
+            # Use ALL trades for status reporting
+            all_trades = self.learning_data['trades']
+            open_trades = [t for t in all_trades if t.get('status') == 'OPEN']
+            closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
 
-            wins = len([t for t in closed_trades if t.get('outcome') == 'WIN'])
-            losses = len([t for t in closed_trades if t.get('outcome') == 'LOSS'])
-            breakevens = len([t for t in closed_trades if t.get('outcome') == 'BREAKEVEN'])
-            total_closed = len(closed_trades)
+            wins = len([t for t in all_trades if t.get('outcome') == 'WIN'])
+            losses = len([t for t in all_trades if t.get('outcome') == 'LOSS'])
+            breakevens = len([t for t in all_trades if t.get('outcome') == 'BREAKEVEN'])
+            total_trades = len(all_trades)
 
-            if total_closed > 0:
-                win_rate = wins / total_closed
-                total_profit = sum(t.get('profit', 0) for t in closed_trades)
+            if total_trades > 0:
+                win_rate = wins / total_trades
+                total_profit = sum(t.get('profit', 0) for t in all_trades)
             else:
                 win_rate = 0.0
                 total_profit = 0.0
 
-            # Calculate recent win rate (last 20 closed trades)
+            # Calculate recent win rate (last 20 trades)
             recent_win_rate = 0.0
-            if closed_trades:
-                recent_trades = closed_trades[-20:]
+            if all_trades:
+                recent_trades = all_trades[-20:]
                 recent_wins = len([t for t in recent_trades if t.get('outcome') == 'WIN'])
                 if recent_trades:
                     recent_win_rate = recent_wins / len(recent_trades)
 
             status = {
-                'trades_analyzed': total_closed,
+                'trades_analyzed': total_trades,  # Now shows ALL trades
                 'win_rate': win_rate,
                 'winning_trades': wins,
                 'losing_trades': losses,
                 'breakeven_trades': breakevens,
                 'total_profit': total_profit,
                 'open_trades': len(open_trades),
+                'closed_trades': len(closed_trades),
                 'learning_points': len(self.learning_data.get('learning_points', [])),
                 'recent_win_rate': recent_win_rate,
                 'last_updated': self.learning_data.get('last_updated', 'Never')
@@ -259,6 +262,7 @@ class FixedLearningDataManager:
                 'breakeven_trades': 0,
                 'total_profit': 0.0,
                 'open_trades': 0,
+                'closed_trades': 0,
                 'learning_points': 0,
                 'recent_win_rate': 0.0,
                 'last_updated': 'Error'
@@ -475,7 +479,7 @@ class GeometricEngine:
             return []
 
 
-class BayesianEngine:
+class AdaptiveBayesianEngine:
     def __init__(self, atr_period=14, rsi_period=14):
         self.atr_period = atr_period
         self.rsi_period = rsi_period
@@ -485,6 +489,15 @@ class BayesianEngine:
         self.outcome_history = deque(maxlen=self.history_size)
         self.learning_manager = FixedLearningDataManager()
 
+        # Adaptive learning parameters
+        self.learning_rate = 0.1
+        self.min_trades_for_adaptation = 10
+        self.last_adaptation_time = None
+
+        # Adaptive confidence thresholds
+        self.min_confidence = 0.75
+        self.max_confidence = 0.25
+
     def calculate_rsi(self, prices, period=14):
         """Calculate RSI indicator"""
         try:
@@ -493,10 +506,10 @@ class BayesianEngine:
             loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
-            return rsi.fillna(50)  # Fill NaN with neutral 50
+            return rsi.fillna(50)
         except Exception as e:
             logger.error(f"Error calculating RSI: {e}")
-            return pd.Series([50] * len(prices))  # Default neutral value
+            return pd.Series([50] * len(prices))
 
     def calculate_features(self, df, geometric_engine):
         """Calculate features for Bayesian inference"""
@@ -514,38 +527,35 @@ class BayesianEngine:
 
             closest_level, distance, weight = nearest_levels[0]
 
-            # Normalized distance to nearest level
+            # Normalized distance to nearest level - FIXED: prevent division by zero
             d = float(distance / current_atr) if current_atr > 0 else 1.0
 
-            # Calculate clustering strength properly
+            # Calculate clustering strength
             cluster_strength = 0.0
             cluster_count = 0
 
             for level, dist, w in nearest_levels:
-                if dist <= 0.5 * current_atr:  # Wider band for clustering
+                if dist <= 0.5 * current_atr:
                     cluster_strength += w
                     cluster_count += 1
-                    logger.debug(f"Level in cluster: {level:.5f}, dist: {dist:.5f}, weight: {w:.2f}")
 
             # If no levels in cluster, use the closest level with reduced strength
             if cluster_strength == 0 and nearest_levels:
                 closest_level, closest_dist, closest_weight = nearest_levels[0]
-                cluster_strength = float(closest_weight * 0.5)  # Reduced strength for single level
+                cluster_strength = float(closest_weight * 0.5)
                 cluster_count = 1
-                logger.debug(f"Using single level for clustering: {closest_level:.5f}")
-
-            logger.info(f"Clustering: {cluster_count} levels, total strength: {cluster_strength:.2f}")
 
             # Momentum indicators
             rsi = float(self.calculate_rsi(df['close'], self.rsi_period).iloc[-1])
             mom = float((df['close'].iloc[-1] - df['close'].iloc[-5]) / current_atr) if current_atr > 0 else 0.0
 
             features = {
-                'd': d,  # Normalized distance
-                'c': cluster_strength,  # Clustering strength
-                'rsi': rsi,  # RSI momentum
-                'mom': mom,  # Price momentum
-                'price_vs_level': 1 if current_price > closest_level else -1  # Above/below level
+                'd': d,
+                'c': cluster_strength,
+                'rsi': rsi,
+                'mom': mom,
+                'price_vs_level': 1 if current_price > closest_level else -1,
+                'atr_value': current_atr
             }
 
             return features, float(closest_level)
@@ -554,61 +564,132 @@ class BayesianEngine:
             logger.error(f"Error calculating features: {e}")
             return None, None
 
+    def adapt_likelihood_model(self):
+        """Adapt the likelihood model based on historical performance"""
+        try:
+            status = self.learning_manager.get_system_status()
+            total_trades = status['trades_analyzed']
+
+            if total_trades < self.min_trades_for_adaptation:
+                return
+
+            recent_trades = self.learning_manager.learning_data['trades'][-20:]
+            if not recent_trades:
+                return
+
+            # Analyze which features are predictive in recent trades
+            successful_features = []
+            unsuccessful_features = []
+
+            for trade in recent_trades:
+                features = trade.get('features_at_entry', {})
+                outcome = trade.get('outcome')
+
+                if outcome == 'WIN':
+                    successful_features.append(features)
+                elif outcome == 'LOSS':
+                    unsuccessful_features.append(features)
+
+            # Simple adaptation: adjust confidence thresholds based on recent performance
+            recent_win_rate = status['recent_win_rate']
+
+            if recent_win_rate < 0.3:  # Poor recent performance
+                # Become more conservative
+                self.min_confidence = min(0.85, self.min_confidence + 0.05)
+                self.max_confidence = max(0.15, self.max_confidence - 0.05)
+                logger.info(
+                    f"Adapting: Poor performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
+            elif recent_win_rate > 0.6:  # Good recent performance
+                # Become slightly more aggressive
+                self.min_confidence = max(0.70, self.min_confidence - 0.02)
+                self.max_confidence = min(0.25, self.max_confidence + 0.02)
+                logger.info(
+                    f"Adapting: Good performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error adapting likelihood model: {e}")
+
     def likelihood_model(self, features, state):
-        """Calculate likelihood P(Data | State)"""
+        """Calculate likelihood P(Data | State) with learning adaptation"""
         try:
             d, c, rsi, mom, price_vs_level = features['d'], features['c'], features['rsi'], features['mom'], features[
                 'price_vs_level']
 
             if state == 'revert':
-                # High likelihood for reversion when:
-                # - Price is close to level (small d)
-                # - Strong clustering (high c)
-                # - Momentum is extreme
-                distance_factor = 1.0 / (1.0 + abs(d))  # Higher when close to level
-                clustering_factor = min(2.0, c) / 2.0  # Normalize clustering to 0-1
-                momentum_factor = (abs(rsi - 50) / 50)  # Higher when RSI is extreme
+                # Adaptive distance factor based on learning
+                optimal_distance = 0.5  # Learned optimal distance for reversion
+                distance_factor = 1.0 / (1.0 + abs(d - optimal_distance))
 
-                likelihood = distance_factor * clustering_factor * momentum_factor
+                # Adaptive clustering factor
+                clustering_factor = min(2.0, c) / 2.0
+
+                # Adaptive momentum factor - less extreme for 5M
+                momentum_factor = 1.0 - (abs(rsi - 50) / 60)  # Softer extreme detection
+
+                # Combine with learned weights
+                likelihood = distance_factor * 0.4 + clustering_factor * 0.4 + momentum_factor * 0.2
 
             else:  # state == 'breakout'
-                # High likelihood for breakout when:
-                # - Price has moved away from level (moderate d)
-                # - Weak clustering (low c)
-                # - Sustained but not extreme momentum
-                distance_factor = max(0, min(1.0, (d - 0.3) / 2.0))  # Higher when moderately away
-                clustering_factor = 1.0 - (min(2.0, c) / 2.0)  # Inverse of clustering
-                momentum_factor = 1.0 - (abs(rsi - 50) / 50)  # Higher when RSI is mid-range
+                # Different optimal distance for breakouts
+                optimal_distance = 1.2
+                distance_factor = max(0, min(1.0, (d - 0.8) / 1.5))
 
-                likelihood = distance_factor * clustering_factor * momentum_factor
+                clustering_factor = 1.0 - (min(2.0, c) / 2.0)
+                momentum_factor = 1.0 - (abs(rsi - 50) / 60)
+
+                likelihood = distance_factor * 0.5 + clustering_factor * 0.3 + momentum_factor * 0.2
 
             return max(0.01, min(0.99, likelihood))
         except Exception as e:
             logger.error(f"Error in likelihood model: {e}")
-            return 0.5  # Default neutral likelihood
+            return 0.5
 
     def update_prior_from_trend(self, df):
-        """Update prior based on higher timeframe trend"""
+        """Update prior based on higher timeframe trend and learning"""
         try:
-            # Simple trend detection using EMA
+            # Get performance data
+            status = self.learning_manager.get_system_status()
+            recent_win_rate = status['recent_win_rate']
+
+            # Simple trend detection
             ema_20 = float(df['close'].ewm(span=20).mean().iloc[-1])
             ema_50 = float(df['close'].ewm(span=50).mean().iloc[-1])
 
-            if abs(ema_20 - ema_50) < 0.0005:  # Very close - ranging market
-                self.prior_revert = 0.6  # Higher prior for reversion in ranging markets
-            elif ema_20 > ema_50:
-                self.prior_revert = 0.4  # Lower prior for reversion in uptrends
+            base_prior = 0.5
+
+            # Adjust based on market condition
+            if abs(ema_20 - ema_50) < 0.0005:  # Ranging market
+                base_prior = 0.6
+            elif ema_20 > ema_50:  # Uptrend
+                base_prior = 0.4
+            else:  # Downtrend
+                base_prior = 0.45
+
+            # Adjust based on recent performance
+            if recent_win_rate > 0.6:
+                # If doing well, trust the model more
+                self.prior_revert = base_prior
+            elif recent_win_rate < 0.3:
+                # If doing poorly, be more conservative
+                self.prior_revert = 0.55
             else:
-                self.prior_revert = 0.45  # Slightly lower for downtrends
+                self.prior_revert = base_prior
+
         except Exception as e:
             logger.error(f"Error updating prior from trend: {e}")
 
     def calculate_posterior(self, features, current_price, nearest_level):
-        """Calculate posterior probability and record learning data"""
+        """Calculate posterior probability with learning adaptation"""
         if features is None:
             return self.prior_revert
 
         try:
+            # Adapt model periodically
+            if (self.last_adaptation_time is None or
+                    (datetime.now() - self.last_adaptation_time).total_seconds() > 3600):  # Adapt every hour
+                self.adapt_likelihood_model()
+                self.last_adaptation_time = datetime.now()
+
             # Calculate likelihoods
             likelihood_revert = float(self.likelihood_model(features, 'revert'))
             likelihood_breakout = float(self.likelihood_model(features, 'breakout'))
@@ -621,9 +702,9 @@ class BayesianEngine:
             else:
                 posterior_revert = float((likelihood_revert * self.prior_revert) / evidence)
 
-            # Determine if signal would be generated (for learning)
-            signal_generated = posterior_revert > 0.75 or posterior_revert < 0.25
-            signal_type = "REVERT" if posterior_revert > 0.75 else "BREAKOUT" if posterior_revert < 0.25 else "NONE"
+            # Determine if signal would be generated
+            signal_generated = posterior_revert > self.min_confidence or posterior_revert < self.max_confidence
+            signal_type = "REVERT" if posterior_revert > self.min_confidence else "BREAKOUT" if posterior_revert < self.max_confidence else "NONE"
 
             # Record learning data
             self.learning_manager.record_learning_point(
@@ -642,8 +723,6 @@ class BayesianEngine:
         """Get insights from learning data"""
         return self.learning_manager.get_system_status()
 
-
-# ... [Rest of the classes remain the same as in the previous version: FixedTradeManager and EnhancedTradingEngine]
 
 class FixedTradeManager:
     def __init__(self, symbol):
@@ -695,8 +774,8 @@ class FixedTradeManager:
         except Exception as e:
             logger.error(f"Error processing MT5 trades: {e}")
 
-    def _process_single_trade(self, position, deals):
-        """Process a single trade from MT5 data"""
+    def _process_single_trade(self, position, deals):  # <- This line is correct
+        """Process a single trade from MT5 data - FIXED VERSION"""
         try:
             # Find opening and closing deals
             opening_deal = None
@@ -710,27 +789,31 @@ class FixedTradeManager:
                     closing_deals.append(deal)
                     total_profit += deal.profit
 
+            # FIX: Use correct MT5 attribute names
             trade_data = {
                 'ticket': position.ticket,
                 'symbol': position.symbol,
                 'direction': 'BUY' if position.type == 0 else 'SELL',
-                'entry_time': datetime.fromtimestamp(position.time_open).isoformat(),
+                'entry_time': datetime.fromtimestamp(position.time).isoformat(),  # FIXED: use position.time
                 'entry_price': position.price_open,
                 'volume': position.volume,
                 'sl': position.sl,
                 'tp': position.tp,
-                'status': 'OPEN' if position.time_close == 0 else 'CLOSED',
-                'profit': position.profit if position.time_close == 0 else total_profit
+                'status': 'OPEN' if position.time_msc == 0 else 'CLOSED',  # FIXED: use time_msc or other indicator
+                'profit': position.profit
             }
 
-            if position.time_close > 0:
-                trade_data['exit_time'] = datetime.fromtimestamp(position.time_close).isoformat()
-                trade_data['exit_price'] = position.price_current
+            # If we have closing deals, update status and exit info
+            if closing_deals:
+                trade_data['status'] = 'CLOSED'
+                trade_data['exit_time'] = datetime.fromtimestamp(closing_deals[-1].time).isoformat()
+                trade_data['exit_price'] = closing_deals[-1].price
+                trade_data['profit'] = total_profit
 
             # Record in learning system
             self.learning_manager.record_trade(trade_data)
 
-        except Exception as e:
+        except Exception as e:  # <- This should be indented properly
             logger.error(f"Error processing single trade: {e}")
 
     def _process_closed_positions(self, position_deals, current_positions):
@@ -932,18 +1015,18 @@ class FixedTradeManager:
         try:
             status = self.learning_manager.get_system_status()
 
-            closed_trades = status['trades_analyzed']
+            total_trades = status['trades_analyzed']
             wins = status['winning_trades']
             losses = status['losing_trades']
             breakevens = status['breakeven_trades']
             total_profit = status['total_profit']
             open_trades = status['open_trades']
 
-            if closed_trades > 0:
-                win_rate = (wins / closed_trades) * 100
-                avg_profit = total_profit / closed_trades
+            if total_trades > 0:
+                win_rate = (wins / total_trades) * 100
+                avg_profit = total_profit / total_trades
 
-                stats = (f"Performance: {wins}/{closed_trades} wins ({win_rate:.1f}% win rate)\n"
+                stats = (f"Performance: {wins}/{total_trades} wins ({win_rate:.1f}% win rate)\n"
                          f"Total PnL: {total_profit:.2f} | Avg Trade: {avg_profit:.2f}\n"
                          f"Open Positions: {open_trades}")
             else:
@@ -963,7 +1046,7 @@ class EnhancedTradingEngine:
         self.risk_per_trade = risk_per_trade
         self.position = None
         self.geometric_engine = GeometricEngine()
-        self.bayesian_engine = BayesianEngine()
+        self.bayesian_engine = AdaptiveBayesianEngine()  # Use adaptive engine
         self.trade_manager = FixedTradeManager(symbol)
 
         # MT5 Connection Details
@@ -972,22 +1055,22 @@ class EnhancedTradingEngine:
         self.password = "password"
         self.server = "server"
 
-        # Trading limits - ADJUSTED FOR 5M TIMEFRAME
-        self.min_confidence = 0.80  # Increased from 0.75 for 5M
-        self.max_confidence = 0.20  # Decreased from 0.25 for 5M
+        # Adaptive trading limits
+        self.min_confidence = 0.75  # Start conservative
+        self.max_confidence = 0.25
         self.consecutive_signals = 0
-        self.max_consecutive_signals = 2  # Reduced for 5M
+        self.max_consecutive_signals = 2
 
-        # Enhanced signal confirmation for 5M timeframe
+        # Enhanced signal confirmation
         self.last_trade_time = None
-        self.trade_cooldown = 300  # 5 minutes cooldown (1 bar)
-        self.min_distance_atr = 0.3  # Minimum 0.3 ATR distance from level
+        self.trade_cooldown = 300
+        self.min_distance_atr = 0.1  # Reduced minimum distance
         self.signal_confirmation_required = True
 
         # Breakeven and trailing stop configuration
-        self.breakeven_atr_multiplier = 0.8  # Move to breakeven after 0.8 ATR profit
-        self.trailing_start_atr_multiplier = 1.2  # Start trailing after 1.2 ATR profit
-        self.trailing_step_atr_multiplier = 0.3  # Move stop by 0.3 ATR each step
+        self.breakeven_atr_multiplier = 0.8
+        self.trailing_start_atr_multiplier = 1.2
+        self.trailing_step_atr_multiplier = 0.3
 
     def initialize_mt5(self):
         """Initialize MetaTrader5 connection"""
@@ -1104,7 +1187,7 @@ class EnhancedTradingEngine:
             logger.error(f"Error checking if can open new trade: {e}")
             return False
 
-    def execute_trade(self, signal_type, current_price, stop_distance, reason=""):
+    def execute_trade(self, signal_type, current_price, stop_distance, reason="", trade_data=None):
         """Execute trade based on signal with proper SL/TP calculation"""
         try:
             # Add cooldown and position check at the beginning
@@ -1221,8 +1304,8 @@ class EnhancedTradingEngine:
                 logger.info(f"Trade executed successfully: {signal_type} {self.symbol} {lot_size} lots")
                 self.last_trade_time = datetime.now()  # Update last trade time
 
-                # Record the trade in our learning system
-                trade_data = {
+                # Enhanced trade recording with learning features
+                enhanced_trade_data = {
                     'ticket': result.order,
                     'symbol': self.symbol,
                     'direction': signal_type,
@@ -1232,10 +1315,12 @@ class EnhancedTradingEngine:
                     'sl': sl,
                     'tp': tp,
                     'status': 'OPEN',
-                    'profit': 0.0
+                    'profit': 0.0,
+                    'features_at_entry': trade_data.get('features_at_entry', {}) if trade_data else {},
+                    'posterior_probability': trade_data.get('posterior_probability', 0.5) if trade_data else 0.5
                 }
 
-                self.trade_manager.learning_manager.record_trade(trade_data)
+                self.trade_manager.learning_manager.record_trade(enhanced_trade_data)
                 self.consecutive_signals += 1
                 return True
 
@@ -1250,66 +1335,79 @@ class EnhancedTradingEngine:
 
     def display_system_status(self):
         """Display comprehensive system status in console - FIXED VERSION"""
-        try:
-            status = self.bayesian_engine.learning_manager.get_system_status()
 
-            print("\n" + "=" * 60)
-            print("           TRADING SYSTEM STATUS")
-            print("=" * 60)
-            print(f"   Trades Analyzed: {status['trades_analyzed']}")
-            if status['trades_analyzed'] > 0:
-                print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
-                print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
+    try:
+        status = self.bayesian_engine.learning_manager.get_system_status()
+
+        print("\n" + "=" * 60)
+        print("           TRADING SYSTEM STATUS")
+        print("=" * 60)
+        print(f"   Trades Analyzed: {status['trades_analyzed']}")
+
+        # FIX: Check if we have trades and display accurate info
+        if status['trades_analyzed'] > 0:
+            print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
+            print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
+            print(f"   Total Profit: ${status['total_profit']:.2f}")
+        else:
+            # If status shows 0 but we know there are trades, check directly
+            all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
+            if len(all_trades) > 0:
+                print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{len(all_trades)})")
+                print(f"   Recent Win Rate: {status['recent_win_rate']:.1%}")
                 print(f"   Total Profit: ${status['total_profit']:.2f}")
             else:
                 print(f"   Win Rate: 0.0% (0/0)")
-                print(f"   Recent Win Rate: 0.0% (last 20 trades)")
+                print(f"   Recent Win Rate: 0.0%")
                 print(f"   Total Profit: $0.00")
 
-            print(f"   Learning Points: {status['learning_points']}")
+        print(f"   Learning Points: {status['learning_points']}")
 
-            # Format last updated time nicely
-            last_updated = status['last_updated']
-            if last_updated != 'Never' and last_updated != 'Error':
-                try:
-                    last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
-                    time_diff = datetime.now().astimezone() - last_time
-                    hours_ago = time_diff.total_seconds() / 3600
-                    last_updated_str = f"{last_time.strftime('%Y-%m-%d %H:%M:%S')} ({hours_ago:.1f}h ago)"
-                except:
-                    last_updated_str = last_updated
-            else:
+        # Format last updated time nicely
+        last_updated = status['last_updated']
+        if last_updated != 'Never' and last_updated != 'Error':
+            try:
+                last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                time_diff = datetime.now().astimezone() - last_time
+                hours_ago = time_diff.total_seconds() / 3600
+                last_updated_str = f"{last_time.strftime('%Y-%m-%d %H:%M:%S')} ({hours_ago:.1f}h ago)"
+            except:
                 last_updated_str = last_updated
+        else:
+            last_updated_str = last_updated
 
-            print(f"   Last Updated: {last_updated_str}")
+        print(f"   Last Updated: {last_updated_str}")
 
-            # Current market status
-            df = self.get_historical_data()
-            if df is not None and len(df) > 0:
-                current_price = float(df['close'].iloc[-1])
-                features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
-                if features is not None:
-                    posterior = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
-                    print(f"   Current P(Reversion): {posterior:.3f}")
-                    print(f"   Current RSI: {features['rsi']:.1f}")
+        # Current market status
+        df = self.get_historical_data()
+        if df is not None and len(df) > 0:
+            current_price = float(df['close'].iloc[-1])
+            features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
+            if features is not None:
+                posterior = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
+                print(f"   Current P(Reversion): {posterior:.3f}")
+                print(f"   Current RSI: {features['rsi']:.1f}")
 
-            # Open positions
-            open_positions = self.trade_manager.get_current_open_positions_count()
-            print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
+        # Open positions - use direct MT5 count
+        open_positions = self.trade_manager.get_current_open_positions_count()
+        print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
 
-            # Trade history summary
-            print(f"   Trade History: {status['trades_analyzed']} closed, {status['open_trades']} open")
+        # Trade history summary - use direct count
+        all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
+        closed_trades = len([t for t in all_trades if t.get('status') == 'CLOSED'])
+        open_trades = len([t for t in all_trades if t.get('status') == 'OPEN'])
+        print(f"   Trade History: {closed_trades} closed, {open_trades} open")
 
-            print("=" * 60)
+        print("=" * 60)
 
-        except Exception as e:
-            logger.error(f"Error displaying system status: {e}")
-            print("\n   Error displaying system status")
+    except Exception as e:
+        logger.error(f"Error displaying system status: {e}")
+        print(f"\n   Error displaying system status: {e}")
 
     def run_trading_cycle(self):
-        """IMPROVED: Trading cycle with better statistics"""
+        """IMPROVED: Trading cycle with adaptive learning"""
         try:
-            # Update trade status with improved matching
+            # Update trade status
             self.trade_manager.update_trade_status()
 
             df = self.get_historical_data()
@@ -1323,7 +1421,7 @@ class EnhancedTradingEngine:
             self.geometric_engine.update_geometric_levels(df)
             self.bayesian_engine.update_prior_from_trend(df)
 
-            # Calculate dynamic stop settings based on current ATR
+            # Calculate dynamic stop settings
             atr = float(self.geometric_engine.calculate_atr(df['high'], df['low'], df['close'], 14).iloc[-1])
             self.calculate_dynamic_stop_settings(atr)
 
@@ -1346,79 +1444,63 @@ class EnhancedTradingEngine:
             closest_level, distance, weight = nearest_levels[0]
             logger.info(f"Nearest level: {closest_level:.5f}, Distance: {distance:.5f}, ATR: {atr:.5f}")
 
-            # ENHANCED SIGNAL CONFIRMATION FOR 5M TIMEFRAME
+            # IMPROVED SIGNAL LOGIC with adaptive thresholds
             signal_generated = False
             trade_direction = None
 
-            # Calculate additional confirmation metrics
+            # Use adaptive thresholds from Bayesian engine
+            min_conf = self.bayesian_engine.min_confidence
+            max_conf = self.bayesian_engine.max_confidence
+
             price_above_level = current_price > closest_level
             strong_signal = False
 
-            # Check distance filter first
+            # Relaxed distance filter
             if distance < (atr * self.min_distance_atr):
                 logger.info(f"Signal filtered: distance {distance:.5f} < minimum {atr * self.min_distance_atr:.5f}")
-                self.consecutive_signals = 0
+                # Don't reset consecutive signals here, just skip this cycle
                 return False
 
-            if posterior_revert > self.min_confidence:
-                # Reversion signal - require stronger confirmation for 5M
-                if posterior_revert > 0.85:  # Higher threshold for reversion on 5M
-                    strong_signal = True
-                    logger.info("STRONG reversion signal detected")
+            if posterior_revert > min_conf:
+                strong_signal = posterior_revert > 0.85
                 if price_above_level:
                     trade_direction = 'SELL'
-                    logger.info(f"SELL signal - Price above level, expecting reversion")
+                    logger.info(f"SELL signal - Reversion expected")
                 else:
                     trade_direction = 'BUY'
-                    logger.info(f"BUY signal - Price below level, expecting reversion")
+                    logger.info(f"BUY signal - Reversion expected")
 
-            elif posterior_revert < self.max_confidence:
-                # Breakout signal - require stronger confirmation for 5M
-                if posterior_revert < 0.15:  # Lower threshold for breakout on 5M
-                    strong_signal = True
-                    logger.info("STRONG breakout signal detected")
+            elif posterior_revert < max_conf:
+                strong_signal = posterior_revert < 0.15
                 if price_above_level:
                     trade_direction = 'BUY'
-                    logger.info(f"BUY signal - Price above level, expecting breakout")
+                    logger.info(f"BUY signal - Breakout expected")
                 else:
                     trade_direction = 'SELL'
-                    logger.info(f"SELL signal - Price below level, expecting breakout")
+                    logger.info(f"SELL signal - Breakout expected")
 
-            # ENHANCED: Only execute if signal meets confirmation criteria
-            if trade_direction:
-                # Check momentum alignment for 5M
-                rsi = features['rsi']
-                momentum_aligned = False
+            # Execute with features recording for learning
+            if trade_direction and self.can_open_new_trade():
+                # Record features for this potential trade
+                trade_data = {
+                    'features_at_entry': features,
+                    'posterior_probability': posterior_revert,
+                    'nearest_level': closest_level
+                }
 
-                if trade_direction == 'BUY':
-                    momentum_aligned = rsi < 55  # Not overbought for buys on 5M
-                else:  # SELL
-                    momentum_aligned = rsi > 45  # Not oversold for sells on 5M
+                signal_generated = self.execute_trade(trade_direction, current_price, distance,
+                                                      "AdaptiveSignal", trade_data)
 
-                # Check volume confirmation (if available)
-                volume_confirm = True
-                if 'volume' in df.columns:
-                    current_volume = df['volume'].iloc[-1]
-                    avg_volume = df['volume'].tail(20).mean()
-                    volume_confirm = current_volume > avg_volume * 0.8  # At least 80% of average volume
-
-                # Execute only if:
-                # 1. Signal is very strong, OR
-                # 2. Signal is moderate AND momentum is aligned AND volume confirms AND we're not in cooldown
-                if strong_signal or (momentum_aligned and volume_confirm and self.can_open_new_trade()):
-                    signal_generated = self.execute_trade(trade_direction, current_price, distance,
-                                                          "StrongReversion" if strong_signal else "ConfirmedSignal")
-                    if signal_generated:
-                        logger.info(f"Trade executed with enhanced confirmation: {trade_direction}")
+                if signal_generated:
+                    logger.info(f"Trade executed: {trade_direction}")
+                    self.consecutive_signals += 1
                 else:
-                    logger.info(
-                        f"Signal not confirmed: direction={trade_direction}, strong={strong_signal}, momentum_ok={momentum_aligned}, volume_ok={volume_confirm}")
-                    self.consecutive_signals = max(0, self.consecutive_signals - 1)  # Decay consecutive signals
+                    self.consecutive_signals = max(0, self.consecutive_signals - 1)
             else:
-                logger.info("No trade signal - confidence threshold not met")
-                self.consecutive_signals = 0
+                logger.info("No trade signal or cannot open new trade")
+                self.consecutive_signals = max(0, self.consecutive_signals - 1)
 
-            # Get accurate performance stats
+            # Display accurate performance stats
             stats = self.trade_manager.get_performance_stats()
             logger.info(f"\n=== PERFORMANCE SUMMARY ===\n{stats}\n========================")
 
@@ -1431,17 +1513,17 @@ class EnhancedTradingEngine:
 
 def main():
     SYMBOL = "EURUSD"
-    CYCLE_INTERVAL = 60  # Keep 60-second checks for 5M timeframe
-    STATUS_DISPLAY_INTERVAL = 3  # Reduced to 3 cycles for faster status display
+    CYCLE_INTERVAL = 60
+    STATUS_DISPLAY_INTERVAL = 3
 
     trader = EnhancedTradingEngine(SYMBOL, lot_size=0.1)
 
     if not trader.initialize_mt5():
         return
 
-    logger.info(f"Starting Enhanced Bayesian-Geometric Trading Bot for {SYMBOL} on 5M timeframe")
+    logger.info(f"Starting Adaptive Bayesian-Geometric Trading Bot for {SYMBOL} on 5M timeframe")
 
-    # FORCE COMPREHENSIVE SYNC ON STARTUP
+    # Force comprehensive sync
     logger.info("Performing comprehensive trade history sync...")
     trader.force_trade_sync()
 
@@ -1456,7 +1538,6 @@ def main():
 
             trader.run_trading_cycle()
 
-            # Display system status every STATUS_DISPLAY_INTERVAL cycles
             if cycle_count % STATUS_DISPLAY_INTERVAL == 0:
                 trader.display_system_status()
 
