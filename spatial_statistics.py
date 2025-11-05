@@ -41,17 +41,23 @@ class FixedLearningDataManager:
         self.load_learning_data()
 
     def load_learning_data(self):
-        """Load historical learning data with backward compatibility"""
+        """Load historical learning data with robust error handling"""
         try:
             if os.path.exists(self.learning_file):
                 with open(self.learning_file, 'r') as f:
-                    loaded_data = json.load(f)
+                    try:
+                        loaded_data = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON corruption detected: {e}. Creating backup and initializing new data.")
+                        # Backup corrupted file
+                        backup_name = f"{self.learning_file}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        os.rename(self.learning_file, backup_name)
+                        loaded_data = {'trades': [], 'learning_points': [], 'last_updated': None}
 
-                # Handle backward compatibility - check if old format exists
+                # Handle backward compatibility
                 if 'trades' in loaded_data:
                     self.learning_data = loaded_data
                 else:
-                    # Convert old format to new format
                     self.learning_data = {
                         'trades': [],
                         'learning_points': loaded_data.get('features', []),
@@ -59,14 +65,18 @@ class FixedLearningDataManager:
                     }
                 logger.info(f"Loaded {len(self.learning_data['trades'])} trade records")
 
+            # Same for model_performance_file
             if os.path.exists(self.model_performance_file):
                 with open(self.model_performance_file, 'r') as f:
-                    self.model_performance = json.load(f)
-                logger.info(f"Loaded model performance data")
+                    try:
+                        self.model_performance = json.load(f)
+                        logger.info("Loaded model performance data")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Model performance JSON corruption: {e}. Initializing new data.")
+                        self.model_performance = {'summary_stats': {}, 'last_updated': None}
 
         except Exception as e:
             logger.error(f"Error loading learning data: {e}")
-            # Initialize with proper structure
             self.learning_data = {'trades': [], 'learning_points': [], 'last_updated': None}
             self.model_performance = {'summary_stats': {}, 'last_updated': None}
 
@@ -149,7 +159,7 @@ class FixedLearningDataManager:
         try:
             # Use ALL trades for statistics, not just closed ones
             all_trades = self.learning_data['trades']
-
+            
             if not all_trades:
                 self.model_performance['summary_stats'] = {
                     'total_trades': 0,
@@ -488,12 +498,12 @@ class AdaptiveBayesianEngine:
         self.feature_history = deque(maxlen=self.history_size)
         self.outcome_history = deque(maxlen=self.history_size)
         self.learning_manager = FixedLearningDataManager()
-
+        
         # Adaptive learning parameters
         self.learning_rate = 0.1
         self.min_trades_for_adaptation = 10
         self.last_adaptation_time = None
-
+        
         # Adaptive confidence thresholds
         self.min_confidence = 0.75
         self.max_confidence = 0.25
@@ -569,63 +579,60 @@ class AdaptiveBayesianEngine:
         try:
             status = self.learning_manager.get_system_status()
             total_trades = status['trades_analyzed']
-
+            
             if total_trades < self.min_trades_for_adaptation:
                 return
-
+                
             recent_trades = self.learning_manager.learning_data['trades'][-20:]
             if not recent_trades:
                 return
-
+                
             # Analyze which features are predictive in recent trades
             successful_features = []
             unsuccessful_features = []
-
+            
             for trade in recent_trades:
                 features = trade.get('features_at_entry', {})
                 outcome = trade.get('outcome')
-
+                
                 if outcome == 'WIN':
                     successful_features.append(features)
                 elif outcome == 'LOSS':
                     unsuccessful_features.append(features)
-
+            
             # Simple adaptation: adjust confidence thresholds based on recent performance
             recent_win_rate = status['recent_win_rate']
-
+            
             if recent_win_rate < 0.3:  # Poor recent performance
                 # Become more conservative
                 self.min_confidence = min(0.85, self.min_confidence + 0.05)
                 self.max_confidence = max(0.15, self.max_confidence - 0.05)
-                logger.info(
-                    f"Adapting: Poor performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
+                logger.info(f"Adapting: Poor performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
             elif recent_win_rate > 0.6:  # Good recent performance
                 # Become slightly more aggressive
                 self.min_confidence = max(0.70, self.min_confidence - 0.02)
                 self.max_confidence = min(0.25, self.max_confidence + 0.02)
-                logger.info(
-                    f"Adapting: Good performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
-
+                logger.info(f"Adapting: Good performance. New thresholds: min={self.min_confidence:.2f}, max={self.max_confidence:.2f}")
+                
         except Exception as e:
             logger.error(f"Error adapting likelihood model: {e}")
 
     def likelihood_model(self, features, state):
         """Calculate likelihood P(Data | State) with learning adaptation"""
         try:
-            d, c, rsi, mom, price_vs_level = features['d'], features['c'], features['rsi'], features['mom'], features[
-                'price_vs_level']
+            d, c, rsi, mom, price_vs_level = features['d'], features['c'], features['rsi'], features['mom'], features['price_vs_level']
 
             if state == 'revert':
                 # Adaptive distance factor based on learning
                 optimal_distance = 0.5  # Learned optimal distance for reversion
                 distance_factor = 1.0 / (1.0 + abs(d - optimal_distance))
-
+                
                 # Adaptive clustering factor
                 clustering_factor = min(2.0, c) / 2.0
-
+                
                 # Adaptive momentum factor - less extreme for 5M
                 momentum_factor = 1.0 - (abs(rsi - 50) / 60)  # Softer extreme detection
-
+                
                 # Combine with learned weights
                 likelihood = distance_factor * 0.4 + clustering_factor * 0.4 + momentum_factor * 0.2
 
@@ -633,10 +640,10 @@ class AdaptiveBayesianEngine:
                 # Different optimal distance for breakouts
                 optimal_distance = 1.2
                 distance_factor = max(0, min(1.0, (d - 0.8) / 1.5))
-
+                
                 clustering_factor = 1.0 - (min(2.0, c) / 2.0)
                 momentum_factor = 1.0 - (abs(rsi - 50) / 60)
-
+                
                 likelihood = distance_factor * 0.5 + clustering_factor * 0.3 + momentum_factor * 0.2
 
             return max(0.01, min(0.99, likelihood))
@@ -650,13 +657,13 @@ class AdaptiveBayesianEngine:
             # Get performance data
             status = self.learning_manager.get_system_status()
             recent_win_rate = status['recent_win_rate']
-
+            
             # Simple trend detection
             ema_20 = float(df['close'].ewm(span=20).mean().iloc[-1])
             ema_50 = float(df['close'].ewm(span=50).mean().iloc[-1])
 
             base_prior = 0.5
-
+            
             # Adjust based on market condition
             if abs(ema_20 - ema_50) < 0.0005:  # Ranging market
                 base_prior = 0.6
@@ -664,7 +671,7 @@ class AdaptiveBayesianEngine:
                 base_prior = 0.4
             else:  # Downtrend
                 base_prior = 0.45
-
+                
             # Adjust based on recent performance
             if recent_win_rate > 0.6:
                 # If doing well, trust the model more
@@ -674,7 +681,7 @@ class AdaptiveBayesianEngine:
                 self.prior_revert = 0.55
             else:
                 self.prior_revert = base_prior
-
+                
         except Exception as e:
             logger.error(f"Error updating prior from trend: {e}")
 
@@ -685,8 +692,8 @@ class AdaptiveBayesianEngine:
 
         try:
             # Adapt model periodically
-            if (self.last_adaptation_time is None or
-                    (datetime.now() - self.last_adaptation_time).total_seconds() > 3600):  # Adapt every hour
+            if (self.last_adaptation_time is None or 
+                (datetime.now() - self.last_adaptation_time).total_seconds() > 3600):  # Adapt every hour
                 self.adapt_likelihood_model()
                 self.last_adaptation_time = datetime.now()
 
@@ -774,7 +781,7 @@ class FixedTradeManager:
         except Exception as e:
             logger.error(f"Error processing MT5 trades: {e}")
 
-    def _process_single_trade(self, position, deals):  # <- This line is correct
+    def _process_single_trade(self, position, deals):
         """Process a single trade from MT5 data - FIXED VERSION"""
         try:
             # Find opening and closing deals
@@ -813,7 +820,7 @@ class FixedTradeManager:
             # Record in learning system
             self.learning_manager.record_trade(trade_data)
 
-        except Exception as e:  # <- This should be indented properly
+        except Exception as e:
             logger.error(f"Error processing single trade: {e}")
 
     def _process_closed_positions(self, position_deals, current_positions):
@@ -998,13 +1005,23 @@ class FixedTradeManager:
         except Exception as e:
             logger.error(f"Error updating trade status: {e}")
 
-    def can_trade(self):
-        """Check if we're allowed to place new trades"""
+    def can_trade(self, proposed_direction=None):
+        """Check if we're allowed to place new trades with direction validation"""
         try:
             current_positions = self.get_current_open_positions_count()
             if current_positions >= self.max_open_trades:
                 logger.warning(f"Already have {current_positions} open positions for {self.symbol}")
                 return False
+            
+            # NEW: Prevent opposing positions
+            if proposed_direction and current_positions > 0:
+                positions = mt5.positions_get(symbol=self.symbol)
+                for pos in positions:
+                    if (proposed_direction == 'BUY' and pos.type == 1) or \
+                       (proposed_direction == 'SELL' and pos.type == 0):
+                        logger.warning(f"Cannot open {proposed_direction} - opposing position exists (Ticket: {pos.ticket})")
+                        return False
+            
             return True
         except Exception as e:
             logger.error(f"Error checking if can trade: {e}")
@@ -1051,9 +1068,9 @@ class EnhancedTradingEngine:
 
         # MT5 Connection Details
         self.mt5_path = r"C:\Program Files\mt5_directory\terminal64.exe"
-        self.account = account
-        self.password = "password"
-        self.server = "server"
+        self.account = account_number
+        self.password = "account_password"
+        self.server = "server_address"
 
         # Adaptive trading limits
         self.min_confidence = 0.75  # Start conservative
@@ -1061,10 +1078,10 @@ class EnhancedTradingEngine:
         self.consecutive_signals = 0
         self.max_consecutive_signals = 2
 
-        # Enhanced signal confirmation
+        # Enhanced signal confirmation - REDUCED MINIMUM DISTANCE
         self.last_trade_time = None
         self.trade_cooldown = 300
-        self.min_distance_atr = 0.1  # Reduced minimum distance
+        self.min_distance_atr = 0.03  # REDUCED from 0.1 to 0.03 (more permissive)
         self.signal_confirmation_required = True
 
         # Breakeven and trailing stop configuration
@@ -1163,11 +1180,11 @@ class EnhancedTradingEngine:
                     f"Trailing start at {self.trade_manager.trailing_start_pips} pips, "
                     f"Step: {self.trade_manager.trailing_step_pips} pips")
 
-    def can_open_new_trade(self):
-        """ACCURATE: Check if we can open new trade"""
+    def can_open_new_trade(self, proposed_direction):
+        """ACCURATE: Check if we can open new trade with direction validation"""
         try:
             if self.last_trade_time is None:
-                return True
+                return self.trade_manager.can_trade(proposed_direction)
 
             time_since_last_trade = datetime.now() - self.last_trade_time
             if time_since_last_trade.total_seconds() < self.trade_cooldown:
@@ -1175,13 +1192,8 @@ class EnhancedTradingEngine:
                     f"Trade cooldown active: {self.trade_cooldown - time_since_last_trade.total_seconds():.0f}s remaining")
                 return False
 
-            # Use accurate position counting
-            current_positions = self.trade_manager.get_current_open_positions_count()
-            if current_positions >= self.trade_manager.max_open_trades:
-                logger.warning(f"Already have {current_positions} open positions for {self.symbol}")
-                return False
-
-            return True
+            # Use accurate position counting with direction validation
+            return self.trade_manager.can_trade(proposed_direction)
 
         except Exception as e:
             logger.error(f"Error checking if can open new trade: {e}")
@@ -1191,11 +1203,11 @@ class EnhancedTradingEngine:
         """Execute trade based on signal with proper SL/TP calculation"""
         try:
             # Add cooldown and position check at the beginning
-            if not self.can_open_new_trade():
-                logger.warning("Trade skipped due to cooldown period or existing position")
+            if not self.can_open_new_trade(signal_type):
+                logger.warning(f"Trade skipped due to cooldown period, existing position, or opposing position")
                 return False
 
-            if not self.trade_manager.can_trade():
+            if not self.trade_manager.can_trade(signal_type):
                 logger.warning("Trade not allowed due to risk limits")
                 return False
 
@@ -1335,77 +1347,75 @@ class EnhancedTradingEngine:
 
     def display_system_status(self):
         """Display comprehensive system status in console - FIXED VERSION"""
+        try:
+            status = self.bayesian_engine.learning_manager.get_system_status()
 
-    try:
-        status = self.bayesian_engine.learning_manager.get_system_status()
-
-        print("\n" + "=" * 60)
-        print("           TRADING SYSTEM STATUS")
-        print("=" * 60)
-        print(f"   Trades Analyzed: {status['trades_analyzed']}")
-
-        # FIX: Check if we have trades and display accurate info
-        if status['trades_analyzed'] > 0:
-            print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
-            print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
-            print(f"   Total Profit: ${status['total_profit']:.2f}")
-        else:
-            # If status shows 0 but we know there are trades, check directly
-            all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
-            if len(all_trades) > 0:
-                print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{len(all_trades)})")
-                print(f"   Recent Win Rate: {status['recent_win_rate']:.1%}")
+            print("\n" + "=" * 60)
+            print("           TRADING SYSTEM STATUS")
+            print("=" * 60)
+            print(f"   Trades Analyzed: {status['trades_analyzed']}")
+            
+            # Check if we have trades and display accurate info
+            if status['trades_analyzed'] > 0:
+                print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
+                print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
                 print(f"   Total Profit: ${status['total_profit']:.2f}")
             else:
-                print(f"   Win Rate: 0.0% (0/0)")
-                print(f"   Recent Win Rate: 0.0%")
-                print(f"   Total Profit: $0.00")
+                all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
+                if len(all_trades) > 0:
+                    print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{len(all_trades)})")
+                    print(f"   Recent Win Rate: {status['recent_win_rate']:.1%}")
+                    print(f"   Total Profit: ${status['total_profit']:.2f}")
+                else:
+                    print(f"   Win Rate: 0.0% (0/0)")
+                    print(f"   Recent Win Rate: 0.0%")
+                    print(f"   Total Profit: $0.00")
 
-        print(f"   Learning Points: {status['learning_points']}")
+            print(f"   Learning Points: {status['learning_points']}")
 
-        # Format last updated time nicely
-        last_updated = status['last_updated']
-        if last_updated != 'Never' and last_updated != 'Error':
-            try:
-                last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
-                time_diff = datetime.now().astimezone() - last_time
-                hours_ago = time_diff.total_seconds() / 3600
-                last_updated_str = f"{last_time.strftime('%Y-%m-%d %H:%M:%S')} ({hours_ago:.1f}h ago)"
-            except:
+            # Format last updated time
+            last_updated = status['last_updated']
+            if last_updated != 'Never' and last_updated != 'Error':
+                try:
+                    last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                    time_diff = datetime.now().astimezone() - last_time
+                    hours_ago = time_diff.total_seconds() / 3600
+                    last_updated_str = f"{last_time.strftime('%Y-%m-%d %H:%M:%S')} ({hours_ago:.1f}h ago)"
+                except:
+                    last_updated_str = last_updated
+            else:
                 last_updated_str = last_updated
-        else:
-            last_updated_str = last_updated
 
-        print(f"   Last Updated: {last_updated_str}")
+            print(f"   Last Updated: {last_updated_str}")
 
-        # Current market status
-        df = self.get_historical_data()
-        if df is not None and len(df) > 0:
-            current_price = float(df['close'].iloc[-1])
-            features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
-            if features is not None:
-                posterior = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
-                print(f"   Current P(Reversion): {posterior:.3f}")
-                print(f"   Current RSI: {features['rsi']:.1f}")
+            # Current market status
+            df = self.get_historical_data()
+            if df is not None and len(df) > 0:
+                current_price = float(df['close'].iloc[-1])
+                features, nearest_level = self.bayesian_engine.calculate_features(df, self.geometric_engine)
+                if features is not None:
+                    posterior = self.bayesian_engine.calculate_posterior(features, current_price, nearest_level)
+                    print(f"   Current P(Reversion): {posterior:.3f}")
+                    print(f"   Current RSI: {features['rsi']:.1f}")
 
-        # Open positions - use direct MT5 count
-        open_positions = self.trade_manager.get_current_open_positions_count()
-        print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
+            # Open positions
+            open_positions = self.trade_manager.get_current_open_positions_count()
+            print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
 
-        # Trade history summary - use direct count
-        all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
-        closed_trades = len([t for t in all_trades if t.get('status') == 'CLOSED'])
-        open_trades = len([t for t in all_trades if t.get('status') == 'OPEN'])
-        print(f"   Trade History: {closed_trades} closed, {open_trades} open")
+            # Trade history summary
+            all_trades = self.bayesian_engine.learning_manager.learning_data['trades']
+            closed_trades = len([t for t in all_trades if t.get('status') == 'CLOSED'])
+            open_trades = len([t for t in all_trades if t.get('status') == 'OPEN'])
+            print(f"   Trade History: {closed_trades} closed, {open_trades} open")
 
-        print("=" * 60)
+            print("=" * 60)
 
-    except Exception as e:
-        logger.error(f"Error displaying system status: {e}")
-        print(f"\n   Error displaying system status: {e}")
+        except Exception as e:
+            logger.error(f"Error displaying system status: {e}")
+            print(f"\n   Error displaying system status: {e}")
 
     def run_trading_cycle(self):
-        """IMPROVED: Trading cycle with adaptive learning"""
+        """IMPROVED: Trading cycle with adaptive learning and opposing position prevention"""
         try:
             # Update trade status
             self.trade_manager.update_trade_status()
@@ -1451,11 +1461,11 @@ class EnhancedTradingEngine:
             # Use adaptive thresholds from Bayesian engine
             min_conf = self.bayesian_engine.min_confidence
             max_conf = self.bayesian_engine.max_confidence
-
+            
             price_above_level = current_price > closest_level
             strong_signal = False
 
-            # Relaxed distance filter
+            # RELAXED distance filter - allow trades closer to levels
             if distance < (atr * self.min_distance_atr):
                 logger.info(f"Signal filtered: distance {distance:.5f} < minimum {atr * self.min_distance_atr:.5f}")
                 # Don't reset consecutive signals here, just skip this cycle
@@ -1480,17 +1490,17 @@ class EnhancedTradingEngine:
                     logger.info(f"SELL signal - Breakout expected")
 
             # Execute with features recording for learning
-            if trade_direction and self.can_open_new_trade():
+            if trade_direction and self.can_open_new_trade(trade_direction):  # FIXED: Added direction check
                 # Record features for this potential trade
                 trade_data = {
                     'features_at_entry': features,
                     'posterior_probability': posterior_revert,
                     'nearest_level': closest_level
                 }
-
-                signal_generated = self.execute_trade(trade_direction, current_price, distance,
-                                                      "AdaptiveSignal", trade_data)
-
+                
+                signal_generated = self.execute_trade(trade_direction, current_price, distance, 
+                                                    "AdaptiveSignal", trade_data)
+                
                 if signal_generated:
                     logger.info(f"Trade executed: {trade_direction}")
                     self.consecutive_signals += 1
@@ -1527,7 +1537,7 @@ def main():
     logger.info("Performing comprehensive trade history sync...")
     trader.force_trade_sync()
 
-    # Display accurate status
+    # Display accurate status - FIXED: call on trader instance
     trader.display_system_status()
 
     try:
@@ -1539,7 +1549,7 @@ def main():
             trader.run_trading_cycle()
 
             if cycle_count % STATUS_DISPLAY_INTERVAL == 0:
-                trader.display_system_status()
+                trader.display_system_status()  # FIXED: call on trader instance
 
             logger.info(f"Waiting {CYCLE_INTERVAL} seconds until next cycle...")
             time.sleep(CYCLE_INTERVAL)
