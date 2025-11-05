@@ -24,219 +24,182 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class LearningDataManager:
+class FixedLearningDataManager:
     def __init__(self):
         self.learning_file = 'learning_data.json'
         self.model_performance_file = 'model_performance.json'
+        # Initialize with proper structure
         self.learning_data = {
-            'features': [],
-            'predictions': [],
-            'model_metrics': [],
+            'trades': [],
+            'learning_points': [],
             'last_updated': None
         }
         self.model_performance = {
-            'win_rates_by_feature_ranges': {},
-            'optimal_thresholds': {},
-            'feature_importance': {},
             'summary_stats': {},
             'last_updated': None
         }
-        self._last_backup_win_rate = 0.0
         self.load_learning_data()
 
     def load_learning_data(self):
-        """Load historical learning data"""
+        """Load historical learning data with backward compatibility"""
         try:
             if os.path.exists(self.learning_file):
                 with open(self.learning_file, 'r') as f:
-                    self.learning_data = json.load(f)
-                logger.info(f"Loaded {len(self.learning_data['features'])} learning records")
+                    loaded_data = json.load(f)
 
-            # Load model performance data
+                # Handle backward compatibility - check if old format exists
+                if 'trades' in loaded_data:
+                    self.learning_data = loaded_data
+                else:
+                    # Convert old format to new format
+                    self.learning_data = {
+                        'trades': [],
+                        'learning_points': loaded_data.get('features', []),
+                        'last_updated': loaded_data.get('last_updated')
+                    }
+                logger.info(f"Loaded {len(self.learning_data['trades'])} trade records")
+
             if os.path.exists(self.model_performance_file):
                 with open(self.model_performance_file, 'r') as f:
                     self.model_performance = json.load(f)
                 logger.info(f"Loaded model performance data")
 
-            # Initialize last backup win rate
-            if self.model_performance.get('summary_stats'):
-                self._last_backup_win_rate = self.model_performance['summary_stats'].get('overall_win_rate', 0.0)
-
         except Exception as e:
             logger.error(f"Error loading learning data: {e}")
-            self.learning_data = {'features': [], 'predictions': [], 'model_metrics': [], 'last_updated': None}
-            self.model_performance = {
-                'win_rates_by_feature_ranges': {},
-                'optimal_thresholds': {},
-                'feature_importance': {},
-                'summary_stats': {},
-                'last_updated': None
-            }
+            # Initialize with proper structure
+            self.learning_data = {'trades': [], 'learning_points': [], 'last_updated': None}
+            self.model_performance = {'summary_stats': {}, 'last_updated': None}
 
     def save_learning_data(self):
-        """Save learning data to file - WITH SMART BACKUP MANAGEMENT"""
+        """Save learning data to file"""
         try:
             self.learning_data['last_updated'] = datetime.now().isoformat()
 
-            # Convert all data to JSON-serializable types
-            serializable_data = self._make_serializable(self.learning_data)
-
             with open(self.learning_file, 'w') as f:
-                json.dump(serializable_data, f, indent=2, default=str)
+                json.dump(self.learning_data, f, indent=2, default=str)
 
-            # SMART BACKUP: Create backup only once per day or when significant learning occurs
-            self._create_smart_backup(serializable_data)
+            with open(self.model_performance_file, 'w') as f:
+                json.dump(self.model_performance, f, indent=2, default=str)
 
         except Exception as e:
             logger.error(f"Error saving learning data: {e}")
 
-    def _create_smart_backup(self, data):
-        """Create backups intelligently based on conditions"""
+    def record_trade(self, trade_data):
+        """Record a complete trade with outcome"""
         try:
-            backup_dir = "learning_backups"
-            os.makedirs(backup_dir, exist_ok=True)
+            trade_record = {
+                'ticket': trade_data.get('ticket'),
+                'symbol': trade_data.get('symbol'),
+                'direction': trade_data.get('direction'),
+                'entry_time': trade_data.get('entry_time'),
+                'exit_time': trade_data.get('exit_time'),
+                'entry_price': float(trade_data.get('entry_price', 0)),
+                'exit_price': float(trade_data.get('exit_price', 0)),
+                'volume': float(trade_data.get('volume', 0)),
+                'profit': float(trade_data.get('profit', 0)),
+                'sl': float(trade_data.get('sl', 0)),
+                'tp': float(trade_data.get('tp', 0)),
+                'status': trade_data.get('status', 'UNKNOWN'),
+                'outcome': self._determine_outcome(trade_data),
+                'features_at_entry': trade_data.get('features_at_entry', {}),
+                'posterior_probability': trade_data.get('posterior_probability', 0.5)
+            }
 
-            # Condition 1: Daily backup (once per day)
-            daily_backup_file = os.path.join(backup_dir,
-                                             f"learning_data_daily_{datetime.now().strftime('%Y%m%d')}.json")
-            if not os.path.exists(daily_backup_file):
-                with open(daily_backup_file, 'w') as f:
-                    json.dump(data, f, indent=2, default=str)
-                logger.info(f"Created daily backup: {daily_backup_file}")
+            # Check if trade already exists
+            existing_idx = None
+            for i, trade in enumerate(self.learning_data['trades']):
+                if trade.get('ticket') == trade_record['ticket']:
+                    existing_idx = i
+                    break
 
-            # Condition 2: Milestone backup (every 100 new learning points)
-            recent_points = len([p for p in data['features']
-                                 if datetime.fromisoformat(p['timestamp']).date() == datetime.now().date()])
+            if existing_idx is not None:
+                # Update existing trade
+                self.learning_data['trades'][existing_idx] = trade_record
+                logger.debug(f"Updated existing trade: {trade_record['ticket']}")
+            else:
+                # Add new trade
+                self.learning_data['trades'].append(trade_record)
+                logger.info(f"Added new trade: {trade_record['ticket']}")
 
-            if recent_points % 100 == 0 and recent_points > 0:
-                milestone_file = os.path.join(backup_dir,
-                                              f"learning_milestone_{recent_points}points_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
-                with open(milestone_file, 'w') as f:
-                    json.dump(data, f, indent=2, default=str)
-                logger.info(f"Created milestone backup: {milestone_file}")
+            # Keep only last 1000 trades
+            if len(self.learning_data['trades']) > 1000:
+                self.learning_data['trades'] = self.learning_data['trades'][-1000:]
 
-            # Condition 3: Performance improvement backup
-            if self._should_backup_for_performance():
-                perf_backup_file = os.path.join(backup_dir,
-                                                f"learning_perf_improvement_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
-                with open(perf_backup_file, 'w') as f:
-                    json.dump(data, f, indent=2, default=str)
-                logger.info(f"Created performance backup: {perf_backup_file}")
+            self._update_performance_stats()
+            self.save_learning_data()
 
-            # Clean up old backups (keep last 30 days)
-            self._cleanup_old_backups(backup_dir)
+            logger.info(
+                f"Recorded trade: {trade_record['ticket']} - {trade_record['outcome']} - Profit: {trade_record['profit']:.2f}")
 
         except Exception as e:
-            logger.error(f"Error creating smart backup: {e}")
+            logger.error(f"Error recording trade: {e}")
 
-    def _should_backup_for_performance(self):
-        """Check if we should backup due to significant performance improvement"""
-        try:
-            if not self.model_performance.get('summary_stats'):
-                return False
-
-            current_win_rate = self.model_performance['summary_stats'].get('overall_win_rate', 0)
-
-            # Check if win rate improved significantly (5% improvement)
-            improvement = current_win_rate - self._last_backup_win_rate
-            if improvement >= 0.05:  # 5% improvement
-                self._last_backup_win_rate = current_win_rate
-                return True
-
-            return False
-        except Exception:
-            return False
-
-    def _cleanup_old_backups(self, backup_dir, keep_days=30):
-        """Remove backups older than keep_days days"""
-        try:
-            cutoff_time = datetime.now() - timedelta(days=keep_days)
-
-            for filename in os.listdir(backup_dir):
-                if filename.startswith("learning_") and filename.endswith(".json"):
-                    filepath = os.path.join(backup_dir, filename)
-                    file_time = datetime.fromtimestamp(os.path.getctime(filepath))
-
-                    if file_time < cutoff_time:
-                        os.remove(filepath)
-                        logger.info(f"Removed old backup: {filename}")
-
-        except Exception as e:
-            logger.error(f"Error cleaning up old backups: {e}")
-
-    def _make_serializable(self, obj):
-        """Convert non-serializable objects to serializable types"""
-        if isinstance(obj, (bool, np.bool_)):
-            return bool(obj)
-        elif isinstance(obj, (int, np.integer)):
-            return int(obj)
-        elif isinstance(obj, (float, np.floating)):
-            return float(obj)
-        elif isinstance(obj, (str, np.str_)):
-            return str(obj)
-        elif isinstance(obj, (list, tuple)):
-            return [self._make_serializable(item) for item in obj]
-        elif isinstance(obj, dict):
-            return {str(key): self._make_serializable(value) for key, value in obj.items()}
-        elif obj is None:
-            return None
-        elif hasattr(obj, 'isoformat'):  # datetime objects
-            return obj.isoformat()
+    def _determine_outcome(self, trade_data):
+        """Determine trade outcome based on profit"""
+        profit = trade_data.get('profit', 0)
+        if profit > 0:
+            return 'WIN'
+        elif profit < 0:
+            return 'LOSS'
         else:
-            return str(obj)  # Fallback: convert to string
+            return 'BREAKEVEN'
 
-    def save_model_performance(self):
-        """Save model performance data"""
+    def _update_performance_stats(self):
+        """Update performance statistics"""
         try:
-            self.model_performance['last_updated'] = datetime.now().isoformat()
+            closed_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'CLOSED']
 
-            # Convert to serializable
-            serializable_perf = self._make_serializable(self.model_performance)
+            if not closed_trades:
+                self.model_performance['summary_stats'] = {
+                    'total_trades': 0,
+                    'winning_trades': 0,
+                    'losing_trades': 0,
+                    'breakeven_trades': 0,
+                    'win_rate': 0.0,
+                    'total_profit': 0.0,
+                    'avg_profit_per_trade': 0.0
+                }
+                return
 
-            with open(self.model_performance_file, 'w') as f:
-                json.dump(serializable_perf, f, indent=2, default=str)
+            wins = len([t for t in closed_trades if t.get('outcome') == 'WIN'])
+            losses = len([t for t in closed_trades if t.get('outcome') == 'LOSS'])
+            breakevens = len([t for t in closed_trades if t.get('outcome') == 'BREAKEVEN'])
+            total_trades = len(closed_trades)
+            total_profit = sum(t.get('profit', 0) for t in closed_trades)
+
+            self.model_performance['summary_stats'] = {
+                'total_trades': total_trades,
+                'winning_trades': wins,
+                'losing_trades': losses,
+                'breakeven_trades': breakevens,
+                'win_rate': wins / total_trades if total_trades > 0 else 0.0,
+                'total_profit': total_profit,
+                'avg_profit_per_trade': total_profit / total_trades if total_trades > 0 else 0.0
+            }
+
+            logger.info(f"Updated performance stats: {wins}/{total_trades} wins ({wins / total_trades:.1%})")
 
         except Exception as e:
-            logger.error(f"Error saving model performance: {e}")
+            logger.error(f"Error updating performance stats: {e}")
 
     def record_learning_point(self, features, posterior, signal_generated, signal_type, current_price, nearest_level):
-        """Record a learning data point - FIXED DATA TYPES"""
+        """Record a learning data point"""
         try:
-            # Ensure all feature values are basic Python types
-            serializable_features = {}
-            for key, value in features.items():
-                if isinstance(value, (np.float64, np.float32, np.int64, np.int32)):
-                    serializable_features[key] = float(value) if isinstance(value, (np.float64, np.float32)) else int(
-                        value)
-                elif isinstance(value, (bool, np.bool_)):
-                    serializable_features[key] = bool(value)
-                else:
-                    serializable_features[key] = value
-
             learning_point = {
                 'timestamp': datetime.now().isoformat(),
-                'features': serializable_features,
+                'features': features,
                 'posterior_probability': float(posterior),
                 'signal_generated': bool(signal_generated),
                 'signal_type': str(signal_type),
                 'price': float(current_price),
-                'nearest_level': float(nearest_level) if nearest_level is not None else 0.0,
-                'level_distance': float(abs(current_price - nearest_level)) if nearest_level is not None else 0.0,
-                'market_context': {
-                    'rsi_level': 'OVERSOLD' if features.get('rsi', 50) < 30 else 'OVERBOUGHT' if features.get('rsi',
-                                                                                                              50) > 70 else 'NEUTRAL',
-                    'distance_category': 'CLOSE' if features.get('d', 0) < 0.5 else 'MEDIUM' if features.get('d',
-                                                                                                             0) < 1.5 else 'FAR',
-                    'clustering_strength': 'STRONG' if features.get('c', 0) > 1.0 else 'WEAK' if features.get('c',
-                                                                                                              0) < 0.5 else 'MEDIUM'
-                }
+                'nearest_level': float(nearest_level) if nearest_level is not None else 0.0
             }
 
-            self.learning_data['features'].append(learning_point)
+            self.learning_data['learning_points'].append(learning_point)
 
             # Keep only last 5000 records to prevent file from growing too large
-            if len(self.learning_data['features']) > 5000:
-                self.learning_data['features'] = self.learning_data['features'][-5000:]
+            if len(self.learning_data['learning_points']) > 5000:
+                self.learning_data['learning_points'] = self.learning_data['learning_points'][-5000:]
 
             self.save_learning_data()
             logger.debug(f"Recorded learning point: P={posterior:.3f}, Signal={signal_type}")
@@ -244,203 +207,45 @@ class LearningDataManager:
         except Exception as e:
             logger.error(f"Error recording learning point: {e}")
 
-    def record_trade_outcome(self, trade_data, outcome, profit, bars_to_completion):
-        """Record the outcome of a trade for learning"""
-        try:
-            prediction_point = {
-                'timestamp': trade_data.get('timestamp'),
-                'entry_price': float(trade_data.get('entry_price', 0)),
-                'direction': str(trade_data.get('direction', '')),
-                'outcome': str(outcome),  # 'WIN', 'LOSS', 'BREAKEVEN'
-                'profit': float(profit),
-                'bars_to_completion': int(bars_to_completion),
-                'reason': str(trade_data.get('reason', '')),
-                'features_at_entry': self.get_features_at_time(trade_data.get('timestamp'))
-            }
-
-            self.learning_data['predictions'].append(prediction_point)
-
-            # Keep only last 1000 predictions
-            if len(self.learning_data['predictions']) > 1000:
-                self.learning_data['predictions'] = self.learning_data['predictions'][-1000:]
-
-            self.save_learning_data()
-            self.update_model_performance()
-
-            logger.info(f"Recorded trade outcome: {outcome}, Profit: {profit:.2f}")
-
-        except Exception as e:
-            logger.error(f"Error recording trade outcome: {e}")
-
-    def get_features_at_time(self, timestamp):
-        """Get features recorded at or near a specific timestamp"""
-        try:
-            if not timestamp:
-                return None
-
-            target_time = datetime.fromisoformat(timestamp)
-            for feature_point in reversed(self.learning_data['features']):
-                feature_time = datetime.fromisoformat(feature_point['timestamp'])
-                time_diff = abs((feature_time - target_time).total_seconds())
-                if time_diff < 300:  # Within 5 minutes
-                    return self._make_serializable(feature_point)
-            return None
-        except Exception as e:
-            logger.error(f"Error getting features at time: {e}")
-            return None
-
-    def update_model_performance(self):
-        """Analyze and update model performance metrics"""
-        try:
-            predictions = self.learning_data['predictions']
-            if len(predictions) < 1:
-                return  # Not enough data
-
-            wins = [p for p in predictions if p.get('outcome') == 'WIN']
-            losses = [p for p in predictions if p.get('outcome') == 'LOSS']
-            breakevens = [p for p in predictions if p.get('outcome') == 'BREAKEVEN']
-
-            total_trades = len(wins) + len(losses) + len(breakevens)
-
-            if total_trades > 0:
-                win_rate = len(wins) / total_trades
-                total_profit = sum(p.get('profit', 0) for p in predictions)
-                avg_profit = total_profit / total_trades if total_trades > 0 else 0
-
-                # Update summary stats
-                self.model_performance['summary_stats'] = {
-                    'total_trades_analyzed': total_trades,
-                    'winning_trades': len(wins),
-                    'losing_trades': len(losses),
-                    'breakeven_trades': len(breakevens),
-                    'overall_win_rate': win_rate,
-                    'total_profit': total_profit,
-                    'average_profit_per_trade': avg_profit
-                }
-
-                # Calculate feature-specific win rates
-                self.analyze_feature_performance()
-
-                # Update optimal thresholds
-                self.calculate_optimal_thresholds()
-
-                logger.info(f"Model performance updated: {len(wins)}/{total_trades} wins ({win_rate:.1%})")
-
-            self.save_model_performance()
-
-        except Exception as e:
-            logger.error(f"Error updating model performance: {e}")
-
-    def analyze_feature_performance(self):
-        """Analyze win rates by feature value ranges"""
-        try:
-            predictions_with_features = [
-                p for p in self.learning_data['predictions']
-                if p.get('features_at_entry') is not None
-            ]
-
-            if len(predictions_with_features) < 5:
-                return
-
-            # Analyze by RSI ranges
-            rsi_ranges = {
-                'OVERSOLD': (0, 30),
-                'NEUTRAL_LOW': (30, 50),
-                'NEUTRAL_HIGH': (50, 70),
-                'OVERBOUGHT': (70, 100)
-            }
-
-            for range_name, (low, high) in rsi_ranges.items():
-                range_trades = [
-                    p for p in predictions_with_features
-                    if low <= p['features_at_entry']['features'].get('rsi', 50) <= high
-                ]
-                if range_trades:
-                    wins = len([t for t in range_trades if t['outcome'] == 'WIN'])
-                    win_rate = wins / len(range_trades)
-                    self.model_performance['win_rates_by_feature_ranges'][f'rsi_{range_name}'] = float(win_rate)
-
-            self.save_model_performance()
-
-        except Exception as e:
-            logger.error(f"Error analyzing feature performance: {e}")
-
-    def calculate_optimal_thresholds(self):
-        """Calculate optimal confidence thresholds based on historical performance"""
-        try:
-            predictions_with_posterior = [
-                p for p in self.learning_data['predictions']
-                if p.get('features_at_entry') and 'posterior_probability' in p['features_at_entry']
-            ]
-
-            if len(predictions_with_posterior) < 10:
-                return
-
-            # Simple threshold optimization (can be enhanced)
-            revert_trades = [p for p in predictions_with_posterior if
-                             p['features_at_entry']['posterior_probability'] > 0.5]
-            breakout_trades = [p for p in predictions_with_posterior if
-                               p['features_at_entry']['posterior_probability'] <= 0.5]
-
-            if revert_trades:
-                revert_win_rate = len([t for t in revert_trades if t['outcome'] == 'WIN']) / len(revert_trades)
-                self.model_performance['optimal_thresholds']['revert_win_rate'] = float(revert_win_rate)
-
-            if breakout_trades:
-                breakout_win_rate = len([t for t in breakout_trades if t['outcome'] == 'WIN']) / len(breakout_trades)
-                self.model_performance['optimal_thresholds']['breakout_win_rate'] = float(breakout_win_rate)
-
-            self.save_model_performance()
-
-        except Exception as e:
-            logger.error(f"Error calculating optimal thresholds: {e}")
-
-    def get_performance_insights(self):
-        """Get current performance insights"""
-        try:
-            insights = {
-                'total_learning_points': len(self.learning_data['features']),
-                'total_trades_recorded': len(self.learning_data['predictions']),
-                'recent_win_rate': 0.0,
-                'feature_performance': self.model_performance.get('win_rates_by_feature_ranges', {}),
-                'optimal_thresholds': self.model_performance.get('optimal_thresholds', {}),
-                'summary_stats': self.model_performance.get('summary_stats', {})
-            }
-
-            if self.learning_data['predictions']:
-                recent_trades = self.learning_data['predictions'][-20:]  # Last 20 trades
-                wins = len([t for t in recent_trades if t.get('outcome') == 'WIN'])
-                if recent_trades:
-                    insights['recent_win_rate'] = float(wins / len(recent_trades))
-
-            return self._make_serializable(insights)
-
-        except Exception as e:
-            logger.error(f"Error getting performance insights: {e}")
-            return {}
-
     def get_system_status(self):
-        """Get system status for display"""
+        """Get accurate system status - FIXED VERSION"""
         try:
-            stats = self.model_performance.get('summary_stats', {})
+            # Ensure we have the latest data
+            closed_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'CLOSED']
+            open_trades = [t for t in self.learning_data['trades'] if t.get('status') == 'OPEN']
+
+            wins = len([t for t in closed_trades if t.get('outcome') == 'WIN'])
+            losses = len([t for t in closed_trades if t.get('outcome') == 'LOSS'])
+            breakevens = len([t for t in closed_trades if t.get('outcome') == 'BREAKEVEN'])
+            total_closed = len(closed_trades)
+
+            if total_closed > 0:
+                win_rate = wins / total_closed
+                total_profit = sum(t.get('profit', 0) for t in closed_trades)
+            else:
+                win_rate = 0.0
+                total_profit = 0.0
+
+            # Calculate recent win rate (last 20 closed trades)
+            recent_win_rate = 0.0
+            if closed_trades:
+                recent_trades = closed_trades[-20:]
+                recent_wins = len([t for t in recent_trades if t.get('outcome') == 'WIN'])
+                if recent_trades:
+                    recent_win_rate = recent_wins / len(recent_trades)
 
             status = {
-                'trades_analyzed': stats.get('total_trades_analyzed', 0),
-                'win_rate': stats.get('overall_win_rate', 0.0),
-                'learning_points': len(self.learning_data['features']),
-                'last_updated': self.learning_data.get('last_updated', 'Never'),
-                'winning_trades': stats.get('winning_trades', 0),
-                'losing_trades': stats.get('losing_trades', 0),
-                'total_profit': stats.get('total_profit', 0.0),
-                'recent_win_rate': 0.0
+                'trades_analyzed': total_closed,
+                'win_rate': win_rate,
+                'winning_trades': wins,
+                'losing_trades': losses,
+                'breakeven_trades': breakevens,
+                'total_profit': total_profit,
+                'open_trades': len(open_trades),
+                'learning_points': len(self.learning_data.get('learning_points', [])),
+                'recent_win_rate': recent_win_rate,
+                'last_updated': self.learning_data.get('last_updated', 'Never')
             }
-
-            # Calculate recent win rate (last 20 trades)
-            if self.learning_data['predictions']:
-                recent_trades = self.learning_data['predictions'][-20:]
-                wins = len([t for t in recent_trades if t.get('outcome') == 'WIN'])
-                if recent_trades:
-                    status['recent_win_rate'] = wins / len(recent_trades)
 
             return status
 
@@ -449,12 +254,14 @@ class LearningDataManager:
             return {
                 'trades_analyzed': 0,
                 'win_rate': 0.0,
-                'learning_points': 0,
-                'last_updated': 'Error',
                 'winning_trades': 0,
                 'losing_trades': 0,
+                'breakeven_trades': 0,
                 'total_profit': 0.0,
-                'recent_win_rate': 0.0
+                'open_trades': 0,
+                'learning_points': 0,
+                'recent_win_rate': 0.0,
+                'last_updated': 'Error'
             }
 
 
@@ -467,26 +274,35 @@ class GeometricEngine:
 
     def calculate_atr(self, high, low, close, period=14):
         """Calculate Average True Range"""
-        tr = np.maximum(high - low,
-                        np.maximum(abs(high - close.shift(1)),
-                                   abs(low - close.shift(1))))
-        return tr.rolling(window=period).mean()
+        try:
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=period).mean()
+            return atr
+        except Exception as e:
+            logger.error(f"Error calculating ATR: {e}")
+            return pd.Series([0.001] * len(high))  # Default fallback
 
     def find_pivot_points(self, high, low, lookback=5):
         """Find swing highs and lows"""
         pivots_high = []
         pivots_low = []
 
-        for i in range(lookback, len(high) - lookback):
-            # Swing High
-            if all(high[i] > high[i - j] for j in range(1, lookback + 1)) and \
-                    all(high[i] > high[i + j] for j in range(1, lookback + 1)):
-                pivots_high.append((i, high.iloc[i]))
+        try:
+            for i in range(lookback, len(high) - lookback):
+                # Swing High
+                if all(high.iloc[i] > high.iloc[i - j] for j in range(1, lookback + 1)) and \
+                        all(high.iloc[i] > high.iloc[i + j] for j in range(1, lookback + 1)):
+                    pivots_high.append((i, high.iloc[i]))
 
-            # Swing Low
-            if all(low[i] < low[i - j] for j in range(1, lookback + 1)) and \
-                    all(low[i] < low[i + j] for j in range(1, lookback + 1)):
-                pivots_low.append((i, low.iloc[i]))
+                # Swing Low
+                if all(low.iloc[i] < low.iloc[i - j] for j in range(1, lookback + 1)) and \
+                        all(low.iloc[i] < low.iloc[i + j] for j in range(1, lookback + 1)):
+                    pivots_low.append((i, low.iloc[i]))
+        except Exception as e:
+            logger.error(f"Error finding pivot points: {e}")
 
         return pivots_high, pivots_low
 
@@ -495,59 +311,74 @@ class GeometricEngine:
         if not pivots:
             return []
 
-        # Extract just the price values
-        pivot_prices = [p[1] for p in pivots]
-        pivot_prices.sort()
+        try:
+            # Extract just the price values
+            pivot_prices = [p[1] for p in pivots]
+            pivot_prices.sort()
 
-        clusters = []
-        current_cluster = [pivot_prices[0]]
+            clusters = []
+            current_cluster = [pivot_prices[0]]
 
-        for price in pivot_prices[1:]:
-            if price - current_cluster[0] <= threshold * atr_value:
-                current_cluster.append(price)
-            else:
-                if len(current_cluster) >= 1:  # Require at least 1 pivot in cluster
-                    clusters.append(current_cluster)
-                current_cluster = [price]
+            for price in pivot_prices[1:]:
+                if price - current_cluster[0] <= threshold * atr_value:
+                    current_cluster.append(price)
+                else:
+                    if len(current_cluster) >= 1:  # Require at least 1 pivot in cluster
+                        clusters.append(current_cluster)
+                    current_cluster = [price]
 
-        if len(current_cluster) >= 1:
-            clusters.append(current_cluster)
+            if len(current_cluster) >= 1:
+                clusters.append(current_cluster)
 
-        # Return cluster centers and weights based on cluster size
-        clustered_levels = []
-        for cluster in clusters:
-            cluster_center = np.mean(cluster)
-            # Weight based on number of pivots in cluster (more pivots = stronger level)
-            cluster_weight = 1.0 + (len(cluster) * 0.2)  # Base 1.0 + 0.2 per additional pivot
-            clustered_levels.append((cluster_center, cluster_weight))
+            # Return cluster centers and weights based on cluster size
+            clustered_levels = []
+            for cluster in clusters:
+                cluster_center = np.mean(cluster)
+                # Weight based on number of pivots in cluster (more pivots = stronger level)
+                cluster_weight = 1.0 + (len(cluster) * 0.2)  # Base 1.0 + 0.2 per additional pivot
+                clustered_levels.append((cluster_center, cluster_weight))
 
-        return clustered_levels
+            return clustered_levels
+        except Exception as e:
+            logger.error(f"Error clustering pivot levels: {e}")
+            return []
 
     def calculate_fibonacci_levels(self, swing_low, swing_high):
         """Calculate Fibonacci retracement and extension levels"""
         fib_levels = {}
-        price_range = swing_high - swing_low
+        try:
+            price_range = swing_high - swing_low
 
-        # Retracement levels (more important, higher weight)
-        fib_ratios_ret = [0.236, 0.382, 0.5, 0.618, 0.786]
-        for ratio in fib_ratios_ret:
-            level = swing_high - (price_range * ratio)
-            fib_levels[f'fib_ret_{ratio}'] = (level, 1.3)  # Higher weight for retracements
+            # Retracement levels (more important, higher weight)
+            fib_ratios_ret = [0.236, 0.382, 0.5, 0.618, 0.786]
+            for ratio in fib_ratios_ret:
+                level = swing_high - (price_range * ratio)
+                fib_levels[f'fib_ret_{ratio}'] = (level, 1.3)  # Higher weight for retracements
 
-        # Extension levels (less important, lower weight)
-        fib_ratios_ext = [1.272, 1.414, 1.618]
-        for ratio in fib_ratios_ext:
-            level = swing_high + (price_range * (ratio - 1.0))
-            fib_levels[f'fib_ext_{ratio}'] = (level, 1.1)
+            # Extension levels (less important, lower weight)
+            fib_ratios_ext = [1.272, 1.414, 1.618]
+            for ratio in fib_ratios_ext:
+                level = swing_high + (price_range * (ratio - 1.0))
+                fib_levels[f'fib_ext_{ratio}'] = (level, 1.1)
 
-        return fib_levels
+            return fib_levels
+        except Exception as e:
+            logger.error(f"Error calculating Fibonacci levels: {e}")
+            return {}
 
     def update_geometric_levels(self, df):
         """Main method to update all geometric levels"""
         try:
+            if df is None or len(df) < 50:
+                logger.warning("Insufficient data for geometric level calculation")
+                return
+
             # Calculate ATR for normalization
             atr = self.calculate_atr(df['high'], df['low'], df['close'], self.atr_period)
-            current_atr = atr.iloc[-1]
+            if atr.isnull().all() or atr.iloc[-1] == 0:
+                current_atr = 0.001  # Default fallback
+            else:
+                current_atr = atr.iloc[-1]
 
             # Find pivot points
             pivots_high, pivots_low = self.find_pivot_points(df['high'], df['low'], self.pivot_lookback)
@@ -583,7 +414,6 @@ class GeometricEngine:
                     # Only use Fibonacci if we have a meaningful swing
                     if abs(major_high - major_low) > current_atr:
                         fib_levels = self.calculate_fibonacci_levels(major_low, major_high)
-                        fib_levels = self.calculate_fibonacci_levels(major_low, major_high)
 
                         # Add Fibonacci levels
                         for name, (level, weight) in fib_levels.items():
@@ -606,36 +436,43 @@ class GeometricEngine:
         if not self.geometric_levels:
             return
 
-        sorted_levels = sorted(self.geometric_levels)
-        cleaned_levels = [sorted_levels[0]]
-        cleaned_weights = {sorted_levels[0]: self.level_weights[sorted_levels[0]]}
+        try:
+            sorted_levels = sorted(self.geometric_levels)
+            cleaned_levels = [sorted_levels[0]]
+            cleaned_weights = {sorted_levels[0]: self.level_weights.get(sorted_levels[0], 1.0)}
 
-        for level in sorted_levels[1:]:
-            if abs(level - cleaned_levels[-1]) > threshold * atr_value:
-                cleaned_levels.append(level)
-                cleaned_weights[level] = self.level_weights[level]
-            else:
-                # Merge nearby levels - keep the stronger weight
-                existing_weight = cleaned_weights[cleaned_levels[-1]]
-                new_weight = self.level_weights[level]
-                if new_weight > existing_weight:
-                    cleaned_weights[cleaned_levels[-1]] = new_weight
+            for level in sorted_levels[1:]:
+                if abs(level - cleaned_levels[-1]) > threshold * atr_value:
+                    cleaned_levels.append(level)
+                    cleaned_weights[level] = self.level_weights.get(level, 1.0)
+                else:
+                    # Merge nearby levels - keep the stronger weight
+                    existing_weight = cleaned_weights[cleaned_levels[-1]]
+                    new_weight = self.level_weights.get(level, 1.0)
+                    if new_weight > existing_weight:
+                        cleaned_weights[cleaned_levels[-1]] = new_weight
 
-        self.geometric_levels = cleaned_levels
-        self.level_weights = cleaned_weights
+            self.geometric_levels = cleaned_levels
+            self.level_weights = cleaned_weights
+        except Exception as e:
+            logger.error(f"Error cleaning levels: {e}")
 
     def get_nearest_levels(self, current_price, num_levels=5):
         """Get the nearest geometric levels to current price"""
         if not self.geometric_levels:
             return []
 
-        levels_with_distance = [
-            (float(level), float(abs(level - current_price)), float(self.level_weights.get(level, 1.0)))
-            for level in self.geometric_levels
-        ]
-        levels_sorted = sorted(levels_with_distance, key=lambda x: x[1])
+        try:
+            levels_with_distance = [
+                (float(level), float(abs(level - current_price)), float(self.level_weights.get(level, 1.0)))
+                for level in self.geometric_levels
+            ]
+            levels_sorted = sorted(levels_with_distance, key=lambda x: x[1])
 
-        return levels_sorted[:num_levels]
+            return levels_sorted[:num_levels]
+        except Exception as e:
+            logger.error(f"Error getting nearest levels: {e}")
+            return []
 
 
 class BayesianEngine:
@@ -646,154 +483,173 @@ class BayesianEngine:
         self.history_size = 1000
         self.feature_history = deque(maxlen=self.history_size)
         self.outcome_history = deque(maxlen=self.history_size)
-        self.learning_manager = LearningDataManager()
+        self.learning_manager = FixedLearningDataManager()
 
     def calculate_rsi(self, prices, period=14):
         """Calculate RSI indicator"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi.fillna(50)  # Fill NaN with neutral 50
+        except Exception as e:
+            logger.error(f"Error calculating RSI: {e}")
+            return pd.Series([50] * len(prices))  # Default neutral value
 
     def calculate_features(self, df, geometric_engine):
-        """Calculate features for Bayesian inference - FIXED CLUSTERING"""
-        current_price = float(df['close'].iloc[-1])
-        atr = geometric_engine.calculate_atr(df['high'], df['low'], df['close'], self.atr_period)
-        current_atr = float(atr.iloc[-1])
+        """Calculate features for Bayesian inference"""
+        try:
+            current_price = float(df['close'].iloc[-1])
+            atr = geometric_engine.calculate_atr(df['high'], df['low'], df['close'], self.atr_period)
+            current_atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.001
 
-        # Get nearest geometric levels
-        nearest_levels = geometric_engine.get_nearest_levels(current_price, 5)
+            # Get nearest geometric levels
+            nearest_levels = geometric_engine.get_nearest_levels(current_price, 5)
 
-        if not nearest_levels:
-            logger.warning("No geometric levels found for feature calculation")
+            if not nearest_levels:
+                logger.warning("No geometric levels found for feature calculation")
+                return None, None
+
+            closest_level, distance, weight = nearest_levels[0]
+
+            # Normalized distance to nearest level
+            d = float(distance / current_atr) if current_atr > 0 else 1.0
+
+            # Calculate clustering strength properly
+            cluster_strength = 0.0
+            cluster_count = 0
+
+            for level, dist, w in nearest_levels:
+                if dist <= 0.5 * current_atr:  # Wider band for clustering
+                    cluster_strength += w
+                    cluster_count += 1
+                    logger.debug(f"Level in cluster: {level:.5f}, dist: {dist:.5f}, weight: {w:.2f}")
+
+            # If no levels in cluster, use the closest level with reduced strength
+            if cluster_strength == 0 and nearest_levels:
+                closest_level, closest_dist, closest_weight = nearest_levels[0]
+                cluster_strength = float(closest_weight * 0.5)  # Reduced strength for single level
+                cluster_count = 1
+                logger.debug(f"Using single level for clustering: {closest_level:.5f}")
+
+            logger.info(f"Clustering: {cluster_count} levels, total strength: {cluster_strength:.2f}")
+
+            # Momentum indicators
+            rsi = float(self.calculate_rsi(df['close'], self.rsi_period).iloc[-1])
+            mom = float((df['close'].iloc[-1] - df['close'].iloc[-5]) / current_atr) if current_atr > 0 else 0.0
+
+            features = {
+                'd': d,  # Normalized distance
+                'c': cluster_strength,  # Clustering strength
+                'rsi': rsi,  # RSI momentum
+                'mom': mom,  # Price momentum
+                'price_vs_level': 1 if current_price > closest_level else -1  # Above/below level
+            }
+
+            return features, float(closest_level)
+
+        except Exception as e:
+            logger.error(f"Error calculating features: {e}")
             return None, None
 
-        closest_level, distance, weight = nearest_levels[0]
-
-        # Normalized distance to nearest level
-        d = float(distance / current_atr)
-
-        # Calculate clustering strength properly
-        cluster_strength = 0.0
-        cluster_count = 0
-
-        for level, dist, w in nearest_levels:
-            if dist <= 0.5 * current_atr:  # Wider band for clustering
-                cluster_strength += w
-                cluster_count += 1
-                logger.debug(f"Level in cluster: {level:.5f}, dist: {dist:.5f}, weight: {w:.2f}")
-
-        # If no levels in cluster, use the closest level with reduced strength
-        if cluster_strength == 0 and nearest_levels:
-            closest_level, closest_dist, closest_weight = nearest_levels[0]
-            cluster_strength = float(closest_weight * 0.5)  # Reduced strength for single level
-            cluster_count = 1
-            logger.debug(f"Using single level for clustering: {closest_level:.5f}")
-
-        logger.info(f"Clustering: {cluster_count} levels, total strength: {cluster_strength:.2f}")
-
-        # Momentum indicators
-        rsi = float(self.calculate_rsi(df['close'], self.rsi_period).iloc[-1])
-        mom = float((df['close'].iloc[-1] - df['close'].iloc[-5]) / current_atr)  # 5-period momentum
-
-        features = {
-            'd': d,  # Normalized distance
-            'c': cluster_strength,  # Clustering strength
-            'rsi': rsi,  # RSI momentum
-            'mom': mom,  # Price momentum
-            'price_vs_level': 1 if current_price > closest_level else -1  # Above/below level
-        }
-
-        return features, float(closest_level)
-
     def likelihood_model(self, features, state):
-        """Calculate likelihood P(Data | State) - IMPROVED"""
-        d, c, rsi, mom, price_vs_level = features['d'], features['c'], features['rsi'], features['mom'], features[
-            'price_vs_level']
+        """Calculate likelihood P(Data | State)"""
+        try:
+            d, c, rsi, mom, price_vs_level = features['d'], features['c'], features['rsi'], features['mom'], features[
+                'price_vs_level']
 
-        if state == 'revert':
-            # High likelihood for reversion when:
-            # - Price is close to level (small d)
-            # - Strong clustering (high c)
-            # - Momentum is extreme
-            distance_factor = 1.0 / (1.0 + abs(d))  # Higher when close to level
-            clustering_factor = min(2.0, c) / 2.0  # Normalize clustering to 0-1
-            momentum_factor = (abs(rsi - 50) / 50)  # Higher when RSI is extreme
+            if state == 'revert':
+                # High likelihood for reversion when:
+                # - Price is close to level (small d)
+                # - Strong clustering (high c)
+                # - Momentum is extreme
+                distance_factor = 1.0 / (1.0 + abs(d))  # Higher when close to level
+                clustering_factor = min(2.0, c) / 2.0  # Normalize clustering to 0-1
+                momentum_factor = (abs(rsi - 50) / 50)  # Higher when RSI is extreme
 
-            likelihood = distance_factor * clustering_factor * momentum_factor
+                likelihood = distance_factor * clustering_factor * momentum_factor
 
-        else:  # state == 'breakout'
-            # High likelihood for breakout when:
-            # - Price has moved away from level (moderate d)
-            # - Weak clustering (low c)
-            # - Sustained but not extreme momentum
-            distance_factor = max(0, min(1.0, (d - 0.3) / 2.0))  # Higher when moderately away
-            clustering_factor = 1.0 - (min(2.0, c) / 2.0)  # Inverse of clustering
-            momentum_factor = 1.0 - (abs(rsi - 50) / 50)  # Higher when RSI is mid-range
+            else:  # state == 'breakout'
+                # High likelihood for breakout when:
+                # - Price has moved away from level (moderate d)
+                # - Weak clustering (low c)
+                # - Sustained but not extreme momentum
+                distance_factor = max(0, min(1.0, (d - 0.3) / 2.0))  # Higher when moderately away
+                clustering_factor = 1.0 - (min(2.0, c) / 2.0)  # Inverse of clustering
+                momentum_factor = 1.0 - (abs(rsi - 50) / 50)  # Higher when RSI is mid-range
 
-            likelihood = distance_factor * clustering_factor * momentum_factor
+                likelihood = distance_factor * clustering_factor * momentum_factor
 
-        return max(0.01, min(0.99, likelihood))
+            return max(0.01, min(0.99, likelihood))
+        except Exception as e:
+            logger.error(f"Error in likelihood model: {e}")
+            return 0.5  # Default neutral likelihood
 
     def update_prior_from_trend(self, df):
         """Update prior based on higher timeframe trend"""
-        # Simple trend detection using EMA
-        ema_20 = float(df['close'].ewm(span=20).mean().iloc[-1])
-        ema_50 = float(df['close'].ewm(span=50).mean().iloc[-1])
+        try:
+            # Simple trend detection using EMA
+            ema_20 = float(df['close'].ewm(span=20).mean().iloc[-1])
+            ema_50 = float(df['close'].ewm(span=50).mean().iloc[-1])
 
-        if abs(ema_20 - ema_50) < 0.0005:  # Very close - ranging market
-            self.prior_revert = 0.6  # Higher prior for reversion in ranging markets
-        elif ema_20 > ema_50:
-            self.prior_revert = 0.4  # Lower prior for reversion in uptrends
-        else:
-            self.prior_revert = 0.45  # Slightly lower for downtrends
+            if abs(ema_20 - ema_50) < 0.0005:  # Very close - ranging market
+                self.prior_revert = 0.6  # Higher prior for reversion in ranging markets
+            elif ema_20 > ema_50:
+                self.prior_revert = 0.4  # Lower prior for reversion in uptrends
+            else:
+                self.prior_revert = 0.45  # Slightly lower for downtrends
+        except Exception as e:
+            logger.error(f"Error updating prior from trend: {e}")
 
     def calculate_posterior(self, features, current_price, nearest_level):
         """Calculate posterior probability and record learning data"""
         if features is None:
             return self.prior_revert
 
-        # Calculate likelihoods
-        likelihood_revert = float(self.likelihood_model(features, 'revert'))
-        likelihood_breakout = float(self.likelihood_model(features, 'breakout'))
+        try:
+            # Calculate likelihoods
+            likelihood_revert = float(self.likelihood_model(features, 'revert'))
+            likelihood_breakout = float(self.likelihood_model(features, 'breakout'))
 
-        # Calculate posterior using Bayes' Theorem
-        evidence = likelihood_revert * self.prior_revert + likelihood_breakout * (1 - self.prior_revert)
+            # Calculate posterior using Bayes' Theorem
+            evidence = likelihood_revert * self.prior_revert + likelihood_breakout * (1 - self.prior_revert)
 
-        if evidence == 0:
-            posterior_revert = float(self.prior_revert)
-        else:
-            posterior_revert = float((likelihood_revert * self.prior_revert) / evidence)
+            if evidence == 0:
+                posterior_revert = float(self.prior_revert)
+            else:
+                posterior_revert = float((likelihood_revert * self.prior_revert) / evidence)
 
-        # Determine if signal would be generated (for learning)
-        signal_generated = posterior_revert > 0.75 or posterior_revert < 0.25
-        signal_type = "REVERT" if posterior_revert > 0.75 else "BREAKOUT" if posterior_revert < 0.25 else "NONE"
+            # Determine if signal would be generated (for learning)
+            signal_generated = posterior_revert > 0.75 or posterior_revert < 0.25
+            signal_type = "REVERT" if posterior_revert > 0.75 else "BREAKOUT" if posterior_revert < 0.25 else "NONE"
 
-        # Record learning data
-        self.learning_manager.record_learning_point(
-            features, posterior_revert, signal_generated, signal_type, float(current_price), float(nearest_level)
-        )
+            # Record learning data
+            self.learning_manager.record_learning_point(
+                features, posterior_revert, signal_generated, signal_type, float(current_price), float(nearest_level)
+            )
 
-        logger.debug(f"Likelihoods - Revert: {likelihood_revert:.3f}, Breakout: {likelihood_breakout:.3f}")
-        logger.debug(f"Prior: {self.prior_revert:.3f}, Posterior: {posterior_revert:.3f}")
+            logger.debug(f"Likelihoods - Revert: {likelihood_revert:.3f}, Breakout: {likelihood_breakout:.3f}")
+            logger.debug(f"Prior: {self.prior_revert:.3f}, Posterior: {posterior_revert:.3f}")
 
-        return posterior_revert
+            return posterior_revert
+        except Exception as e:
+            logger.error(f"Error calculating posterior: {e}")
+            return self.prior_revert
 
     def get_learning_insights(self):
         """Get insights from learning data"""
-        return self.learning_manager.get_performance_insights()
+        return self.learning_manager.get_system_status()
 
 
-class TradeManager:
+# ... [Rest of the classes remain the same as in the previous version: FixedTradeManager and EnhancedTradingEngine]
+
+class FixedTradeManager:
     def __init__(self, symbol):
         self.symbol = symbol
-        self.trade_history = []
-        self.daily_pnl = 0.0
-        self.max_daily_loss = -100.0
+        self.learning_manager = FixedLearningDataManager()
         self.max_open_trades = 2
-        self.learning_manager = LearningDataManager()
 
         # Breakeven and trailing stop settings
         self.breakeven_pips = 10
@@ -801,143 +657,129 @@ class TradeManager:
         self.trailing_step_pips = 5
         self.breakeven_buffer_pips = 1
 
-        self.load_trade_history()
-
-    def set_symbol(self, symbol):
-        """Set the symbol for stop management"""
-        self.symbol = symbol
-
-    def load_trade_history(self):
-        """Load trade history from file"""
+    def sync_with_mt5_complete(self):
+        """Complete synchronization with MT5"""
         try:
-            if os.path.exists('trade_history.json'):
-                with open('trade_history.json', 'r') as f:
-                    self.trade_history = json.load(f)
-                logger.info(f"Loaded {len(self.trade_history)} historical trades")
-        except Exception as e:
-            logger.error(f"Error loading trade history: {e}")
+            logger.info("Starting complete MT5 synchronization...")
 
-    def save_trade_history(self):
-        """Save trade history to file"""
-        try:
-            with open('trade_history.json', 'w') as f:
-                json.dump(self.trade_history, f, indent=2, default=str)
-        except Exception as e:
-            logger.error(f"Error saving trade history: {e}")
+            # Get all positions and deals
+            positions = mt5.positions_get(symbol=self.symbol) or []
+            deals = mt5.history_deals_get(datetime.now() - timedelta(days=30), datetime.now()) or []
 
-    def record_trade(self, symbol, direction, volume, entry_price, sl, tp, reason=""):
-        """Record a new trade"""
-        trade = {
-            'timestamp': datetime.now().isoformat(),
-            'symbol': symbol,
-            'direction': direction,
-            'volume': float(volume),
-            'entry_price': float(entry_price),
-            'sl': float(sl),
-            'tp': float(tp),
-            'reason': reason,
-            'status': 'OPEN',
-            'ticket': None,  # Will be populated when we match with MT5
-            'profit': 0.0,
-            'exit_price': 0.0
-        }
-        self.trade_history.append(trade)
-        self.save_trade_history()
-        logger.info(f"Recorded trade: {direction} {symbol} {volume} lots")
-        return trade
+            logger.info(f"Found {len(positions)} positions and {len(deals)} deals")
 
-    def match_trades_with_positions(self):
-        """IMPROVED: Better trade matching with MT5 positions"""
-        try:
-            positions = mt5.positions_get(symbol=self.symbol)
-            if positions is None:
-                positions = []
-
-            # Get today's deals for closed trades
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
-            if deals is None:
-                deals = []
-
-            logger.info(f"Matching: {len(positions)} positions, {len(deals)} deals found")
-
-            # Update open trades first
-            for trade in self.trade_history:
-                if trade.get('status') == 'OPEN':
-                    matched = False
-
-                    # Try to match by ticket first
-                    if trade.get('ticket'):
-                        for pos in positions:
-                            if pos.ticket == trade['ticket']:
-                                trade['ticket'] = pos.ticket
-                                matched = True
-                                break
-
-                    # If no ticket match, try by approximate price and time
-                    if not matched:
-                        for pos in positions:
-                            price_match = abs(trade['entry_price'] - pos.price_open) < 0.0010  # Wider tolerance
-                            time_match = True  # Assume match if price is close
-
-                            if price_match and time_match:
-                                trade['ticket'] = pos.ticket
-                                matched = True
-                                logger.info(f"Matched trade by price: {trade['entry_price']} vs {pos.price_open}")
-                                break
-
-            # Now check for closed trades
-            for trade in self.trade_history:
-                if trade.get('status') == 'OPEN' and trade.get('ticket'):
-                    # Check if position still exists
-                    position_still_open = any(pos.ticket == trade['ticket'] for pos in positions)
-
-                    if not position_still_open:
-                        # Trade was closed - find in deal history
-                        trade_profit = 0.0
-                        exit_price = trade['entry_price']
-
-                        for deal in deals:
-                            if (deal.position_id == trade['ticket'] or
-                                    abs(trade['entry_price'] - deal.price) < 0.0010):
-                                trade_profit += deal.profit
-                                exit_price = deal.price
-                                logger.info(f"Found closing deal for ticket {trade['ticket']}")
-
-                        if trade_profit != 0:  # Only mark closed if we found deals
-                            trade['status'] = 'CLOSED'
-                            trade['exit_price'] = float(exit_price)
-                            trade['profit'] = float(trade_profit)
-                            trade['exit_time'] = datetime.now().isoformat()
-
-                            # Determine outcome
-                            if trade_profit > 0:
-                                outcome = 'WIN'
-                            elif trade_profit < 0:
-                                outcome = 'LOSS'
-                            else:
-                                outcome = 'BREAKEVEN'
-
-                            # Calculate bars to completion
-                            entry_time = datetime.fromisoformat(trade['timestamp'])
-                            exit_time = datetime.now()
-                            bars_to_completion = max(1, int((exit_time - entry_time).total_seconds() / 300))
-
-                            # Record outcome for learning
-                            self.learning_manager.record_trade_outcome(
-                                trade, outcome, trade_profit, bars_to_completion
-                            )
-
-                            logger.info(f"Trade closed: {trade['direction']} {self.symbol}, "
-                                        f"Outcome: {outcome}, Profit: {trade_profit:.2f}")
-
-            self.save_trade_history()
+            # Process all trades from MT5 data
+            self._process_mt5_trades(positions, deals)
 
         except Exception as e:
-            logger.error(f"Error in trade matching: {e}")
+            logger.error(f"Error in complete sync: {e}")
+
+    def _process_mt5_trades(self, positions, deals):
+        """Process all trades from MT5 data"""
+        try:
+            # Group deals by position ticket
+            position_deals = {}
+            for deal in deals:
+                pos_id = deal.position_id
+                if pos_id not in position_deals:
+                    position_deals[pos_id] = []
+                position_deals[pos_id].append(deal)
+
+            # Process each position
+            for pos in positions:
+                self._process_single_trade(pos, position_deals.get(pos.ticket, []))
+
+            # Process closed positions that aren't in current positions
+            self._process_closed_positions(position_deals, positions)
+
+        except Exception as e:
+            logger.error(f"Error processing MT5 trades: {e}")
+
+    def _process_single_trade(self, position, deals):
+        """Process a single trade from MT5 data"""
+        try:
+            # Find opening and closing deals
+            opening_deal = None
+            closing_deals = []
+            total_profit = 0.0
+
+            for deal in deals:
+                if deal.entry == 0:  # DEAL_ENTRY_IN
+                    opening_deal = deal
+                elif deal.entry == 1:  # DEAL_ENTRY_OUT
+                    closing_deals.append(deal)
+                    total_profit += deal.profit
+
+            trade_data = {
+                'ticket': position.ticket,
+                'symbol': position.symbol,
+                'direction': 'BUY' if position.type == 0 else 'SELL',
+                'entry_time': datetime.fromtimestamp(position.time_open).isoformat(),
+                'entry_price': position.price_open,
+                'volume': position.volume,
+                'sl': position.sl,
+                'tp': position.tp,
+                'status': 'OPEN' if position.time_close == 0 else 'CLOSED',
+                'profit': position.profit if position.time_close == 0 else total_profit
+            }
+
+            if position.time_close > 0:
+                trade_data['exit_time'] = datetime.fromtimestamp(position.time_close).isoformat()
+                trade_data['exit_price'] = position.price_current
+
+            # Record in learning system
+            self.learning_manager.record_trade(trade_data)
+
+        except Exception as e:
+            logger.error(f"Error processing single trade: {e}")
+
+    def _process_closed_positions(self, position_deals, current_positions):
+        """Process positions that are closed but not in current positions"""
+        try:
+            current_tickets = [pos.ticket for pos in current_positions]
+
+            for pos_id, deals in position_deals.items():
+                if pos_id not in current_tickets:
+                    # This is a closed position
+                    opening_deal = None
+                    closing_deals = []
+                    total_profit = 0.0
+                    entry_time = None
+                    exit_time = None
+
+                    for deal in deals:
+                        if deal.entry == 0:  # Opening deal
+                            opening_deal = deal
+                            entry_time = datetime.fromtimestamp(deal.time)
+                        elif deal.entry == 1:  # Closing deal
+                            closing_deals.append(deal)
+                            total_profit += deal.profit
+                            exit_time = datetime.fromtimestamp(deal.time)
+
+                    if opening_deal and closing_deals:
+                        trade_data = {
+                            'ticket': pos_id,
+                            'symbol': self.symbol,
+                            'direction': 'BUY' if opening_deal.type == 0 else 'SELL',
+                            'entry_time': entry_time.isoformat(),
+                            'exit_time': exit_time.isoformat(),
+                            'entry_price': opening_deal.price,
+                            'exit_price': closing_deals[-1].price,
+                            'volume': opening_deal.volume,
+                            'profit': total_profit,
+                            'sl': 0.0,
+                            'tp': 0.0,
+                            'status': 'CLOSED'
+                        }
+
+                        self.learning_manager.record_trade(trade_data)
+                        logger.info(f"Processed closed position: {pos_id} - Profit: {total_profit:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error processing closed positions: {e}")
 
     def get_current_open_positions_count(self):
-        """ACCURATE: Get actual number of open positions from MT5"""
+        """Get actual number of open positions from MT5"""
         try:
             positions = mt5.positions_get(symbol=self.symbol)
             if positions is None:
@@ -1065,160 +907,45 @@ class TradeManager:
             logger.error(f"Error updating trailing stop: {e}")
 
     def update_trade_status(self):
-        """Update status of open trades and record outcomes - UPDATED VERSION"""
+        """Update status of open trades"""
         try:
-            # NEW: Update stops before checking status
             self.update_stops_for_open_trades()
-
-            self.match_trades_with_positions()
+            self.sync_with_mt5_complete()  # Use the new sync method
 
         except Exception as e:
             logger.error(f"Error updating trade status: {e}")
 
     def can_trade(self):
         """Check if we're allowed to place new trades"""
-        if self.daily_pnl <= self.max_daily_loss:
-            logger.warning(f"Daily PnL ({self.daily_pnl}) below maximum loss limit")
-            return False
-
-        positions = mt5.positions_get(symbol=self.symbol)
-        if positions and len(positions) >= self.max_open_trades:
-            logger.warning(f"Maximum open trades ({self.max_open_trades}) reached")
-            return False
-
-        return True
-
-    def sync_with_mt5(self):
-        """IMPROVED: Better synchronization with MT5"""
         try:
-            logger.info("Starting MT5 synchronization...")
-
-            # Get current positions
-            positions = mt5.positions_get(symbol=self.symbol)
-            if positions is None:
-                positions = []
-
-            # Get account info for balance
-            account_info = mt5.account_info()
-            balance = account_info.balance if account_info else 0
-
-            # Get today's deals
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            deals = mt5.history_deals_get(today, datetime.now() + timedelta(days=1))
-            if deals is None:
-                deals = []
-
-            logger.info(f"Sync found: {len(positions)} positions, {len(deals)} deals, Balance: {balance}")
-
-            # Rebuild trade history from MT5 data for accuracy
-            self.rebuild_trade_history_from_mt5(positions, deals)
-
+            current_positions = self.get_current_open_positions_count()
+            if current_positions >= self.max_open_trades:
+                logger.warning(f"Already have {current_positions} open positions for {self.symbol}")
+                return False
+            return True
         except Exception as e:
-            logger.error(f"Error during MT5 sync: {e}")
-
-    def rebuild_trade_history_from_mt5(self, positions, deals):
-        """REBUILD: Create accurate trade history from MT5 data"""
-        try:
-            # Clear existing history and rebuild from MT5
-            new_trade_history = []
-
-            # Process open positions
-            for pos in positions:
-                if pos.symbol == self.symbol and pos.magic == 234000:
-                    trade = {
-                        'timestamp': datetime.fromtimestamp(pos.time).isoformat(),
-                        'symbol': pos.symbol,
-                        'direction': 'BUY' if pos.type == 0 else 'SELL',
-                        'volume': float(pos.volume),
-                        'entry_price': float(pos.price_open),
-                        'sl': float(pos.sl),
-                        'tp': float(pos.tp),
-                        'reason': 'MT5_Sync',
-                        'status': 'OPEN',
-                        'ticket': pos.ticket,
-                        'profit': float(pos.profit),
-                        'exit_price': 0.0
-                    }
-                    new_trade_history.append(trade)
-                    logger.info(f"Added open position: {trade['direction']} {pos.ticket}")
-
-            # Process closed deals (group by position)
-            closed_positions = {}
-            for deal in deals:
-                if deal.entry == 1:  # DEAL_ENTRY_IN (opening deal)
-                    closed_positions[deal.position_id] = {
-                        'ticket': deal.position_id,
-                        'entry_time': datetime.fromtimestamp(deal.time),
-                        'direction': 'BUY' if deal.type == 0 else 'SELL',
-                        'entry_price': deal.price,
-                        'volume': deal.volume,
-                        'profit': 0.0,
-                        'exit_time': None
-                    }
-                elif deal.entry == 0:  # DEAL_ENTRY_OUT (closing deal)
-                    if deal.position_id in closed_positions:
-                        closed_positions[deal.position_id]['profit'] += deal.profit
-                        closed_positions[deal.position_id]['exit_time'] = datetime.fromtimestamp(deal.time)
-                        closed_positions[deal.position_id]['exit_price'] = deal.price
-
-            # Add closed trades to history
-            for pos_id, trade_data in closed_positions.items():
-                if trade_data['exit_time']:  # Only add completed trades
-                    trade = {
-                        'timestamp': trade_data['entry_time'].isoformat(),
-                        'symbol': self.symbol,
-                        'direction': trade_data['direction'],
-                        'volume': float(trade_data['volume']),
-                        'entry_price': float(trade_data['entry_price']),
-                        'sl': 0.0,
-                        'tp': 0.0,
-                        'reason': 'MT5_History',
-                        'status': 'CLOSED',
-                        'ticket': pos_id,
-                        'profit': float(trade_data['profit']),
-                        'exit_price': float(trade_data.get('exit_price', trade_data['entry_price'])),
-                        'exit_time': trade_data['exit_time'].isoformat()
-                    }
-                    new_trade_history.append(trade)
-                    logger.info(f"Added closed trade: {trade['direction']} {pos_id}, Profit: {trade['profit']:.2f}")
-
-            # Replace old history with rebuilt one
-            self.trade_history = new_trade_history
-            self.save_trade_history()
-
-            logger.info(f"Rebuilt trade history: {len(self.trade_history)} total trades")
-
-        except Exception as e:
-            logger.error(f"Error rebuilding trade history: {e}")
+            logger.error(f"Error checking if can trade: {e}")
+            return False
 
     def get_performance_stats(self):
-        """ACCURATE: Calculate performance statistics from reliable data"""
+        """Get accurate performance statistics"""
         try:
-            if not self.trade_history:
-                return "No trades recorded"
+            status = self.learning_manager.get_system_status()
 
-            closed_trades = [t for t in self.trade_history if t.get('status') == 'CLOSED']
-            open_trades = [t for t in self.trade_history if t.get('status') == 'OPEN']
+            closed_trades = status['trades_analyzed']
+            wins = status['winning_trades']
+            losses = status['losing_trades']
+            breakevens = status['breakeven_trades']
+            total_profit = status['total_profit']
+            open_trades = status['open_trades']
 
-            if not closed_trades:
-                return f"No closed trades yet. {len(open_trades)} open positions."
+            if closed_trades > 0:
+                win_rate = (wins / closed_trades) * 100
+                avg_profit = total_profit / closed_trades
 
-            wins = len([t for t in closed_trades if t.get('profit', 0) > 0])
-            losses = len([t for t in closed_trades if t.get('profit', 0) < 0])
-            breakevens = len([t for t in closed_trades if t.get('profit', 0) == 0])
-            total_closed = len(closed_trades)
-
-            if total_closed > 0:
-                win_rate = (wins / total_closed) * 100
-                total_profit = sum(t.get('profit', 0) for t in closed_trades)
-                avg_profit = total_profit / total_closed
-
-                # Calculate current open positions profit
-                current_open_profit = sum(t.get('profit', 0) for t in open_trades)
-
-                stats = (f"Performance: {wins}/{total_closed} wins ({win_rate:.1f}% win rate)\n"
+                stats = (f"Performance: {wins}/{closed_trades} wins ({win_rate:.1f}% win rate)\n"
                          f"Total PnL: {total_profit:.2f} | Avg Trade: {avg_profit:.2f}\n"
-                         f"Open Positions: {len(open_trades)} | Current PnL: {current_open_profit:.2f}")
+                         f"Open Positions: {open_trades}")
             else:
                 stats = "No completed trades yet"
 
@@ -1237,7 +964,7 @@ class EnhancedTradingEngine:
         self.position = None
         self.geometric_engine = GeometricEngine()
         self.bayesian_engine = BayesianEngine()
-        self.trade_manager = TradeManager(symbol)
+        self.trade_manager = FixedTradeManager(symbol)
 
         # MT5 Connection Details
         self.mt5_path = r"C:\Program Files\mt5_directory\terminal64.exe"
@@ -1494,16 +1221,21 @@ class EnhancedTradingEngine:
                 logger.info(f"Trade executed successfully: {signal_type} {self.symbol} {lot_size} lots")
                 self.last_trade_time = datetime.now()  # Update last trade time
 
-                trade_data = self.trade_manager.record_trade(
-                    symbol=self.symbol,
-                    direction=signal_type,
-                    volume=lot_size,
-                    entry_price=price,
-                    sl=sl,
-                    tp=tp,
-                    reason=reason
-                )
+                # Record the trade in our learning system
+                trade_data = {
+                    'ticket': result.order,
+                    'symbol': self.symbol,
+                    'direction': signal_type,
+                    'entry_time': datetime.now().isoformat(),
+                    'entry_price': price,
+                    'volume': lot_size,
+                    'sl': sl,
+                    'tp': tp,
+                    'status': 'OPEN',
+                    'profit': 0.0
+                }
 
+                self.trade_manager.learning_manager.record_trade(trade_data)
                 self.consecutive_signals += 1
                 return True
 
@@ -1512,24 +1244,29 @@ class EnhancedTradingEngine:
             return False
 
     def force_trade_sync(self):
-        """IMPROVED: Force complete synchronization"""
+        """Force complete synchronization"""
         logger.info("Forcing complete trade synchronization with MT5...")
-        self.trade_manager.sync_with_mt5()
-        self.trade_manager.match_trades_with_positions()
+        self.trade_manager.sync_with_mt5_complete()
 
     def display_system_status(self):
-        """Display comprehensive system status in console"""
+        """Display comprehensive system status in console - FIXED VERSION"""
         try:
             status = self.bayesian_engine.learning_manager.get_system_status()
 
-            print("\n" + "=" * 50)
-            print("       TRADING SYSTEM STATUS")
-            print("=" * 50)
+            print("\n" + "=" * 60)
+            print("           TRADING SYSTEM STATUS")
+            print("=" * 60)
             print(f"   Trades Analyzed: {status['trades_analyzed']}")
-            print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
-            print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
+            if status['trades_analyzed'] > 0:
+                print(f"   Win Rate: {status['win_rate']:.1%} ({status['winning_trades']}/{status['trades_analyzed']})")
+                print(f"   Recent Win Rate: {status['recent_win_rate']:.1%} (last 20 trades)")
+                print(f"   Total Profit: ${status['total_profit']:.2f}")
+            else:
+                print(f"   Win Rate: 0.0% (0/0)")
+                print(f"   Recent Win Rate: 0.0% (last 20 trades)")
+                print(f"   Total Profit: $0.00")
+
             print(f"   Learning Points: {status['learning_points']}")
-            print(f"   Total Profit: ${status['total_profit']:.2f}")
 
             # Format last updated time nicely
             last_updated = status['last_updated']
@@ -1560,7 +1297,10 @@ class EnhancedTradingEngine:
             open_positions = self.trade_manager.get_current_open_positions_count()
             print(f"   Open Positions: {open_positions}/{self.trade_manager.max_open_trades}")
 
-            print("=" * 50)
+            # Trade history summary
+            print(f"   Trade History: {status['trades_analyzed']} closed, {status['open_trades']} open")
+
+            print("=" * 60)
 
         except Exception as e:
             logger.error(f"Error displaying system status: {e}")
@@ -1678,11 +1418,6 @@ class EnhancedTradingEngine:
                 logger.info("No trade signal - confidence threshold not met")
                 self.consecutive_signals = 0
 
-            # Log learning insights periodically
-            if len(self.trade_manager.trade_history) % 5 == 0:  # Every 5 trades
-                insights = self.bayesian_engine.get_learning_insights()
-                logger.info(f"Learning Insights: {insights}")
-
             # Get accurate performance stats
             stats = self.trade_manager.get_performance_stats()
             logger.info(f"\n=== PERFORMANCE SUMMARY ===\n{stats}\n========================")
@@ -1706,10 +1441,11 @@ def main():
 
     logger.info(f"Starting Enhanced Bayesian-Geometric Trading Bot for {SYMBOL} on 5M timeframe")
 
-    # Force initial sync to catch up with existing trades
+    # FORCE COMPREHENSIVE SYNC ON STARTUP
+    logger.info("Performing comprehensive trade history sync...")
     trader.force_trade_sync()
 
-    # Display initial status immediately
+    # Display accurate status
     trader.display_system_status()
 
     try:
